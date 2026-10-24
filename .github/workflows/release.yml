@@ -1,0 +1,131 @@
+name: Build & Release MusicBetaWrapper APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-and-release:
+    name: Build & Sign Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle 8.5
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
+
+      - name: Build Release & Debug APKs with Gradle
+        run: |
+          gradle assembleRelease assembleDebug --stacktrace --no-daemon
+
+      - name: Align & Sign Release APK (Secrets or Auto-Generated Keystore)
+        id: sign_apk
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p release-artifacts
+
+          BUILT_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$BUILT_APK" ]; then
+            echo "Error: No APK found in app/build/outputs/apk/release"
+            exit 1
+          fi
+          echo "Found built APK: $BUILT_APK"
+
+          VERSION_LABEL="${GITHUB_REF_NAME:-v1.0.0}"
+          ALIGNED_APK="release-artifacts/aligned.apk"
+          DEST_APK="release-artifacts/MusicBetaWrapper-${VERSION_LABEL}-signed.apk"
+
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+            echo "Signing APK with provided repository secrets..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
+            KS_PASS="$KEYSTORE_PASSWORD"
+            K_ALIAS="$KEY_ALIAS"
+            K_PASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          else
+            echo "No signing secrets configured; generating self-contained release keystore so APK installs cleanly on Android..."
+            KS_PASS="musicbeta123"
+            K_ALIAS="musicbeta"
+            K_PASS="musicbeta123"
+            keytool -genkeypair -v \
+              -keystore release.keystore \
+              -alias "$K_ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$KS_PASS" \
+              -keypass "$K_PASS" \
+              -dname "CN=MusicBetaWrapper, OU=Mobile, O=MusicBeta, L=Cupertino, ST=CA, C=US"
+          fi
+
+          "$BUILD_TOOLS_DIR/zipalign" -v -p 4 "$BUILT_APK" "$ALIGNED_APK"
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks release.keystore \
+            --ks-key-alias "$K_ALIAS" \
+            --ks-pass pass:"$KS_PASS" \
+            --key-pass pass:"$K_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "$DEST_APK" \
+            "$ALIGNED_APK"
+
+          rm -f release.keystore "$ALIGNED_APK"
+          echo "apk_path=$DEST_APK" >> $GITHUB_OUTPUT
+
+      - name: Upload Signed APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicBetaWrapper-Signed-APK
+          path: ${{ steps.sign_apk.outputs.apk_path }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (on Tag or Main Push)
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MusicBetaWrapper ${{ github.ref_name }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          files: ${{ steps.sign_apk.outputs.apk_path }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ### 🎵 MusicBetaWrapper Signed Android APK (${{ github.ref_name }})
+
+             Ready-to-install signed Android 14+ (API 34) APK wrapping `https://beta.music.apple.com`.
+
+            #### Included Optimizations:
+            - **5 WebView Anti-Lag Optimizations**: 500MB OkHttp disk cache (`shouldInterceptRequest`), `mzstatic.com` `300x300bb.webp` artwork downscaler, telemetry/Sentry blocker, GPU CSS `backdrop-filter` stripper, and zero-reload SPA `window.history.back()`.
+            - **Camera Notch & Status Bar Safe-Area Protection**: Physical `WindowInsetsCompat` (`systemBars() | displayCutout()`) padding + runtime CSS safe-area variables.
+            - **120 Hz+ Display Refresh Rate**: Forced peak hardware display mode.
+            - **Screen-Off & Background Audio**: Foreground `MediaPlaybackService` with `MediaSessionCompat`, `PARTIAL_WAKE_LOCK`, and high-perf Wi-Fi lock.
