@@ -29,7 +29,7 @@
         android:usesCleartextTraffic="false"
         tools:targetApi="34">
 
-        <!-- Main Wrapper Activity: Zero-Reload SPA Lifecycle, Hardware Acceleration & 120Hz Edge-to-Edge -->
+        <!-- Main Wrapper Activity with Edge-to-Edge, High Refresh Rate & Zero-Reload SPA Lifecycle -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

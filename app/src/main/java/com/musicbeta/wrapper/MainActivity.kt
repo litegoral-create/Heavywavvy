@@ -187,9 +187,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Requirement 1: Performance & 120 Hz.
-     */
     private fun enforceMaxDisplayRefreshRate() {
         try {
             val displayObj: Display? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -220,9 +217,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Edge-to-Edge display and Dynamic Status/Navigation Bar Styling for Light and Dark modes.
-     */
     private fun setupEdgeToEdge() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         supportActionBar?.hide()
@@ -244,16 +238,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Requirement: Mobile Status Bar & Camera Cutout Safe Area Handling.
-     * Prevents top headers and navigation elements from rendering under the physical clock,
-     * battery percentage, and camera punch-hole notch.
-     *
-     * 1. Applies physical padding (insets.left, insets.top, insets.right, insets.bottom)
-     *    directly to rootContainer so the WebView viewport starts strictly below the camera notch
-     *    and above the gesture pill, while rootContainer's background fills the status bar smoothly.
-     * 2. Injects CSS custom properties (--safe-area-top, etc.) into the WebView DOM.
-     */
     private fun setupWindowInsetsHandling() {
         ViewCompat.setOnApplyWindowInsetsListener(rootContainer) { view, windowInsets ->
             val insets = windowInsets.getInsets(
@@ -269,23 +253,17 @@ class MainActivity : AppCompatActivity() {
             lastLeftInsetDp = (insets.left / density).toInt()
             lastRightInsetDp = (insets.right / density).toInt()
 
-            // Keep progress bar flush at the top of the safe WebView area
             val progressParams = progressBar.layoutParams as? FrameLayout.LayoutParams
                 ?: (progressBar.layoutParams as? androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams)
             progressParams?.topMargin = 0
             progressBar.layoutParams = progressParams
 
-            // Inject CSS Safe Area variables into current page
             injectSafeAreaInsetsScript()
 
             WindowInsetsCompat.CONSUMED
         }
     }
 
-    /**
-     * Injects CSS variables onto document.documentElement so mobile web headers
-     * respect safe area boundaries without being drawn behind status bar or notch.
-     */
     private fun injectSafeAreaInsetsScript() {
         val cssScript = """
             (function() {
@@ -299,13 +277,8 @@ class MainActivity : AppCompatActivity() {
         executeJavaScript(cssScript)
     }
 
-    /**
-     * Sets status bar and navigation bar icon colors (light vs dark) based on the active theme.
-     */
     private fun updateSystemBarsForCurrentTheme() {
         val isDarkMode = isEffectiveDarkMode()
-        // In Light Mode, icons must be dark (isAppearanceLight = true).
-        // In Dark Mode, icons must be light (isAppearanceLight = false).
         insetsController.isAppearanceLightStatusBars = !isDarkMode
         insetsController.isAppearanceLightNavigationBars = !isDarkMode
     }
@@ -321,9 +294,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Public theme switcher function for setting Light, Dark, or System mode.
-     */
     fun setThemeMode(mode: String) {
         currentThemeMode = mode
         sharedPreferences.edit().putString(KEY_THEME_MODE, mode).apply()
@@ -341,14 +311,6 @@ class MainActivity : AppCompatActivity() {
         AppCompatDelegate.setDefaultNightMode(nightMode)
     }
 
-    /**
-     * Requirement 1, 3, 4 & 5:
-     * - Configure WebView for max speed: RenderPriority.HIGH, JS, DOM storage, database caching, offscreenPreRaster.
-     * - Hardware layer acceleration.
-     * - Dedicated 500 MB OkHttpClient Disk Cache for shouldInterceptRequest static asset caching.
-     * - Dynamic LOAD_DEFAULT / LOAD_CACHE_ELSE_NETWORK offline fallback.
-     * - iOS Safari User-Agent override & Light/Dark mode synchronization.
-     */
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureHighPerformanceWebView() {
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
@@ -381,7 +343,6 @@ class MainActivity : AppCompatActivity() {
             .followSslRedirects(true)
             .addNetworkInterceptor { chain ->
                 val response = chain.proceed(chain.request())
-                // Enforce 7-day immutable disk caching on static assets & album artwork
                 response.newBuilder()
                     .removeHeader("Pragma")
                     .removeHeader("Vary")
@@ -390,7 +351,7 @@ class MainActivity : AppCompatActivity() {
             }
             .build()
 
-        // Optimization 5:LOAD_DEFAULT with offline fallback to LOAD_CACHE_ELSE_NETWORK
+        // Optimization 5: LOAD_DEFAULT with offline fallback to LOAD_CACHE_ELSE_NETWORK
         settings.cacheMode = if (isNetworkAvailable()) {
             WebSettings.LOAD_DEFAULT
         } else {
@@ -435,7 +396,6 @@ class MainActivity : AppCompatActivity() {
         rootContainer.setBackgroundColor(bgColor)
         webView.setBackgroundColor(bgColor)
 
-        // Use AndroidX WebSettingsCompat if supported on this device
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
                 WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, isDark)
@@ -450,7 +410,6 @@ class MainActivity : AppCompatActivity() {
             WebSettingsCompat.setForceDark(webView.settings, forceDarkValue)
         }
 
-        // Also inject color-scheme meta tag into web page DOM
         val themeScript = """
             (function() {
                 const scheme = '${if (isDark) "dark" else "light"}';
@@ -475,10 +434,6 @@ class MainActivity : AppCompatActivity() {
                 errorLayout.visibility = View.GONE
             }
 
-            /**
-             * Optimization 4: Early CSS GPU Performance Injection on onPageCommitVisible
-             * Eliminates backdrop-filter lag and hides app upsell banners before first scroll.
-             */
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 super.onPageCommitVisible(view, url)
                 injectSafeAreaInsetsScript()
@@ -494,12 +449,6 @@ class MainActivity : AppCompatActivity() {
                 injectAudioBridgeScript()
             }
 
-            /**
-             * Optimizations 1, 2 & 3:
-             * 1. Telemetry & Tracker Blocker (metrics.apple.com, xp.apple.com, sentry)
-             * 2. Apple CDN Artwork Optimization (1000x1000bb -> 300x300bb.webp)
-             * 3. Aggressive Disk Caching (.js, .css, .woff2, and mzstatic.com artwork) via OkHttpClient
-             */
             override fun shouldInterceptRequest(
                 view: WebView?,
                 request: WebResourceRequest?
@@ -558,17 +507,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Optimization 3: Returns true if the URL matches known Apple Music telemetry or Sentry crash trackers.
-     */
     private fun isTelemetryOrTrackerUrl(url: String): Boolean {
         val lower = url.lowercase()
         return BLOCKED_TELEMETRY_PATTERNS.any { lower.contains(it) }
     }
 
-    /**
-     * Optimization 3: Immediately returns an empty 204 WebResourceResponse to short-circuit telemetry calls.
-     */
     private fun createEmptyBlockedResponse(): WebResourceResponse {
         return WebResourceResponse(
             "text/plain",
@@ -583,10 +526,6 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * Optimization 2: Rewrites oversized mzstatic.com thumbnails (e.g., 1000x1000bb.jpg, 600x600bb.png)
-     * down to 300x300bb.webp to eliminate main-thread bitmap decoding stutter and save bandwidth.
-     */
     private fun rewriteAppleArtworkUrl(url: String): String {
         if (!url.contains("mzstatic.com", ignoreCase = true)) return url
         val match = MZSTATIC_ARTWORK_REGEX.find(url) ?: return url
@@ -601,9 +540,6 @@ class MainActivity : AppCompatActivity() {
         return url
     }
 
-    /**
-     * Optimization 1: Identifies static assets (.js, .css, .woff2, and mzstatic.com artwork) eligible for disk caching.
-     */
     private fun isCacheableStaticAsset(url: String): Boolean {
         val cleanPath = url.substringBefore('?').lowercase()
         if (cleanPath.contains("mzstatic.com") &&
@@ -620,10 +556,6 @@ class MainActivity : AppCompatActivity() {
             cleanPath.endsWith(".svg")
     }
 
-    /**
-     * Optimization 1: Executes the request through OkHttpClient backed by context.cacheDir
-     * so repeat visits and scrolled album art load instantaneously from disk.
-     */
     private fun fetchFromOkHttpDiskCache(targetUrl: String, webRequest: WebResourceRequest): WebResourceResponse? {
         return try {
             val requestBuilder = Request.Builder()
@@ -688,12 +620,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Optimization 4: CSS GPU Performance Injection.
-     * - Strips heavy real-time backdrop-filter Gaussian blurs that cause scroll stutter.
-     * - Hides "Open in Music App" promotional banners and native upsell overlays.
-     * - Enables GPU layer compositing (transform: translateZ(0)) and offscreen content-visibility: auto.
-     */
     private fun injectGpuPerformanceCss() {
         val gpuCssScript = """
             (function() {
@@ -856,10 +782,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Optimization 5: Zero-Reload SPA Lifecycle on Configuration Changes.
-     * Prevents Activity recreation when rotating screen, resizing window, or toggling system dark mode.
-     */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         enforceMaxDisplayRefreshRate()
@@ -892,11 +814,6 @@ class MainActivity : AppCompatActivity() {
         webView.destroy()
     }
 
-    /**
-     * Optimization 5: Zero-Reload SPA Back Navigation.
-     * Routes the Android Back button through evaluateJavascript("window.history.back()")
-     * so Apple Music's MusicKit JS router transitions views in-memory without a full page reload.
-     */
     private fun setupBackNavigation() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {

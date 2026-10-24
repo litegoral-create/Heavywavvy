@@ -122,7 +122,7 @@ jobs:
           body: |
             ### 🎵 MusicBetaWrapper Signed Android APK (${{ github.ref_name }})
 
-             Ready-to-install signed Android 14+ (API 34) APK wrapping `https://beta.music.apple.com`.
+            Ready-to-install signed Android 14+ (API 34) APK wrapping `https://beta.music.apple.com`.
 
             #### Included Optimizations:
             - **5 WebView Anti-Lag Optimizations**: 500MB OkHttp disk cache (`shouldInterceptRequest`), `mzstatic.com` `300x300bb.webp` artwork downscaler, telemetry/Sentry blocker, GPU CSS `backdrop-filter` stripper, and zero-reload SPA `window.history.back()`.

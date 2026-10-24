@@ -182,13 +182,23 @@ High-performance native Android wrapper around \`https://beta.music.apple.com\`.
               {globalTheme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-indigo-500" />}
             </button>
 
+            <a
+              href="/MusicBetaWrapper-v1.0.0-signed.apk"
+              download="MusicBetaWrapper-v1.0.0-signed.apk"
+              className="flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white text-xs font-extrabold shadow-md shadow-emerald-500/20 transition active:scale-95"
+            >
+              <Download className="w-4 h-4" />
+              <span className="hidden sm:inline">Download Signed APK (1.8 MB)</span>
+              <span className="sm:hidden">Signed APK</span>
+            </a>
+
             <button
               onClick={() => handleTabChange('github-build')}
               className="flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-rose-500/40 text-rose-400 hover:text-rose-300 text-xs font-bold shadow-sm transition active:scale-95"
             >
               <Github className="w-4 h-4" />
-              <span className="hidden sm:inline">Build APK on GitHub</span>
-              <span className="sm:hidden">Build APK</span>
+              <span className="hidden md:inline">Build on GitHub</span>
+              <span className="md:hidden">GitHub</span>
             </button>
 
             <button
@@ -197,10 +207,10 @@ High-performance native Android wrapper around \`https://beta.music.apple.com\`.
               className="flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-rose-500 to-rose-600 hover:from-rose-600 hover:to-rose-700 text-white text-xs font-bold shadow-md shadow-rose-500/20 transition active:scale-95 disabled:opacity-50"
             >
               <Download className="w-4 h-4" />
-              <span className="hidden sm:inline">
-                {isDownloadingZip ? 'Zipping...' : 'Download Project (.zip)'}
+              <span className="hidden lg:inline">
+                {isDownloadingZip ? 'Zipping...' : 'Project (.zip)'}
               </span>
-              <span className="sm:hidden">ZIP</span>
+              <span className="lg:hidden">ZIP</span>
             </button>
           </div>
         </div>
