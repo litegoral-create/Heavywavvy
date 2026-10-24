@@ -183,13 +183,13 @@ High-performance native Android wrapper around \`https://beta.music.apple.com\`.
             </button>
 
             <a
-              href="/MusicBetaWrapper-v1.0.0-signed.apk"
-              download="MusicBetaWrapper-v1.0.0-signed.apk"
+              href="/MusicBetaWrapper-v1.1.0-signed.apk"
+              download="MusicBetaWrapper-v1.1.0-signed.apk"
               className="flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white text-xs font-extrabold shadow-md shadow-emerald-500/20 transition active:scale-95"
             >
               <Download className="w-4 h-4" />
-              <span className="hidden sm:inline">Download Signed APK (1.8 MB)</span>
-              <span className="sm:hidden">Signed APK</span>
+              <span className="hidden sm:inline">Download Fixed APK v1.1.0</span>
+              <span className="sm:hidden">APK v1.1.0</span>
             </a>
 
             <button

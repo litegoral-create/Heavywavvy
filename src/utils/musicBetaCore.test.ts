@@ -107,31 +107,30 @@ test('detectNotchCollision identifies overlap when safe insets are disabled', ()
   assert.equal(isProtected, false);
 });
 
-test('rewriteAppleArtworkUrl rewrites oversized mzstatic.com images down to 300x300bb.webp', () => {
-  const oversized =
+test('rewriteAppleArtworkUrl rewrites oversized square bb images while preserving non-square banners and PNG cutouts', () => {
+  const oversizedSquare =
     'https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/12/34/ab/cover.jpg/1000x1000bb.jpg';
-  const result1 = rewriteAppleArtworkUrl(oversized);
+  const result1 = rewriteAppleArtworkUrl(oversizedSquare);
   assert.equal(result1.wasRewritten, true);
   assert.equal(result1.originalSpec, '1000x1000bb.jpg');
   assert.equal(
     result1.rewrittenUrl,
-    'https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/12/34/ab/cover.jpg/300x300bb.webp'
+    'https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/12/34/ab/cover.jpg/600x600bb.webp'
   );
 
-  const mediumPng =
-    'https://is2-ssl.mzstatic.com/image/thumb/Music116/v4/aa/bb/cc/art.png/600x600bb.png';
-  const result2 = rewriteAppleArtworkUrl(mediumPng);
-  assert.equal(result2.wasRewritten, true);
-  assert.equal(
-    result2.rewrittenUrl,
-    'https://is2-ssl.mzstatic.com/image/thumb/Music116/v4/aa/bb/cc/art.png/300x300bb.webp'
-  );
+  // Transparent PNG category cutout must NEVER be rewritten to webp
+  const categoryPng =
+    'https://is2-ssl.mzstatic.com/image/thumb/Music116/v4/aa/bb/cc/art.png/580x132bb.png';
+  const result2 = rewriteAppleArtworkUrl(categoryPng);
+  assert.equal(result2.wasRewritten, false);
+  assert.equal(result2.rewrittenUrl, categoryPng);
 
-  const alreadyOptimized =
-    'https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/12/34/ab/cover.jpg/300x300bb.webp';
-  const result3 = rewriteAppleArtworkUrl(alreadyOptimized);
+  // Non-square editorial hero banner must NEVER be squashed into square
+  const heroBanner =
+    'https://is1-ssl.mzstatic.com/image/thumb/Features126/v4/12/34/ab/hero.jpg/1080x540bb.webp';
+  const result3 = rewriteAppleArtworkUrl(heroBanner);
   assert.equal(result3.wasRewritten, false);
-  assert.equal(result3.rewrittenUrl, alreadyOptimized);
+  assert.equal(result3.rewrittenUrl, heroBanner);
 });
 
 test('isTelemetryOrTrackerUrl detects metrics.apple.com, xp.apple.com, and sentry endpoints', () => {
@@ -163,11 +162,14 @@ test('isCacheableStaticAsset identifies .js, .css, .woff2, and mzstatic artwork 
   assert.equal(isCacheableStaticAsset('https://metrics.apple.com/tracker.js'), false);
 });
 
-test('generateGpuPerformanceCss and generateSpaBackNavigationScript contain expected optimizations', () => {
-  const css = generateGpuPerformanceCss();
-  assert.ok(css.includes('backdrop-filter: none !important'));
-  assert.ok(css.includes('translateZ(0)'));
-  assert.ok(css.includes('content-visibility: auto'));
+test('generateGpuPerformanceCss and generateSpaBackNavigationScript protect navigation menu and song row heights', () => {
+  const lightCss = generateGpuPerformanceCss(false);
+  assert.ok(lightCss.includes('background-color: #ffffff !important'));
+  assert.ok(lightCss.includes('z-index: 99999 !important'));
+  assert.ok(!lightCss.includes('contain-intrinsic-size: 1px 240px'));
+
+  const darkCss = generateGpuPerformanceCss(true);
+  assert.ok(darkCss.includes('background-color: #1f1f1f !important'));
 
   const backScript = generateSpaBackNavigationScript();
   assert.ok(backScript.includes('window.history.back()'));

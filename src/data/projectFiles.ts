@@ -31,8 +31,8 @@ android {
         applicationId = "com.musicbeta.wrapper"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -187,8 +187,8 @@ dependencies {
     path: 'app/src/main/java/com/musicbeta/wrapper/MainActivity.kt',
     category: 'kotlin',
     language: 'kotlin',
-    description: '5 WebView Anti-Lag Optimizations: OkHttp Disk Cache (shouldInterceptRequest), mzstatic 300x300bb.webp Artwork Downscaler, Telemetry Blocker, GPU CSS Injection, and Zero-Reload SPA Back Navigation.',
-    requirementTags: ['OkHttp Disk Cache', '300x300bb.webp Artwork', 'Telemetry Blocker', 'GPU CSS Injection', 'SPA window.history.back()'],
+    description: 'Production WebView with Widevine DRM (RESOURCE_PROTECTED_MEDIA_ID), 3rd-party cookies, virtual scroll fix, opaque navigation menu (#ffffff/#1f1f1f), and full-bleed mzstatic artwork.',
+    requirementTags: ['Widevine DRM', 'Opaque Nav Menu', 'Full-Bleed Artwork', 'Virtual Scroll Fix', '500MB OkHttp Cache'],
     content: `package com.musicbeta.wrapper
 
 import android.Manifest
@@ -210,7 +210,9 @@ import android.util.Log
 import android.view.Display
 import android.view.View
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -239,35 +241,35 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * MainActivity for MusicBetaWrapper.
- * High-performance, edge-to-edge wrapper around https://beta.music.apple.com
+ * MainActivity for MusicBetaWrapper (v1.1.0).
+ * High-performance, edge-to-edge native Android 14 wrapper around https://music.apple.com
  *
- * Key Capabilities:
- * 1. 120Hz+ Display Refresh Rate Forcing
- * 2. Uninterrupted Background Audio (Screen-Off) via ForegroundService & Wake/Wi-Fi locks
- * 3. 500MB Dedicated Internal WebView & OkHttp Disk Cache (shouldInterceptRequest)
- * 4. Apple CDN (mzstatic.com) Artwork Downscaler (1000x1000bb -> 300x300bb.webp)
- * 5. Telemetry & Tracker Blocker (metrics.apple.com, xp.apple.com, sentry)
- * 6. CSS GPU Performance Injection (strips backdrop-filter blurs, hides app banners, enables translateZ(0) & content-visibility)
- * 7. Zero-Reload SPA Navigation (window.history.back(), RenderPriority.HIGH, configChanges)
+ * Key Fixes & Capabilities:
+ * 1. Virtual Scrolling & Layout Fix: Direct match_parent WebView inside FrameLayout (no ScrollView) + LayoutAlgorithm.NORMAL
+ * 2. Full Browser & CDN Capabilities: DOM Storage, Database, WideViewport, MIXED_CONTENT_ALWAYS_ALLOW, Third-Party Cookies, Mobile Chrome UA
+ * 3. Opaque Navigation Menu & Full-Bleed Cards: Solid #ffffff (Light) / #1f1f1f (Dark) nav drawer, no broken contain-intrinsic-size gaps, native srcset aspect ratios
+ * 4. Widevine DRM Full-Track Playback: Grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID in WebChromeClient
+ * 5. 120Hz+ Display Refresh Rate, Camera Notch Safe-Area Padding & Screen-Off Background Audio Service
  */
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MusicBetaWrapper"
-        private const val APPLE_MUSIC_BETA_URL = "https://beta.music.apple.com"
+        private const val APPLE_MUSIC_URL = "https://music.apple.com"
         private const val NOTIFICATION_PERMISSION_CODE = 1001
         private const val DISK_CACHE_MAX_BYTES = 500L * 1024L * 1024L // 500 MB
 
-        // Preferences for Light/Dark Mode
+        // Preferences for Light/Dark Mode & Cache Schema Migration
         private const val PREFS_NAME = "music_wrapper_prefs"
         private const val KEY_THEME_MODE = "pref_theme_mode"
+        private const val KEY_CACHE_SCHEMA_VERSION = "pref_cache_schema_version"
+        private const val CACHE_SCHEMA_VERSION = 3
         const val THEME_SYSTEM = "system"
         const val THEME_LIGHT = "light"
         const val THEME_DARK = "dark"
 
-        // iOS Safari 17.5 User-Agent (iPhone Mobile)
-        const val IOS_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+        // Modern Mobile Chrome on Android 14 User-Agent (ensures standard mobile CSS & Widevine DRM EME support)
+        const val MOBILE_CHROME_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
         // Broadcast actions between Activity and MediaPlaybackService
         const val ACTION_MEDIA_COMMAND = "com.musicbeta.wrapper.MEDIA_COMMAND"
@@ -277,7 +279,7 @@ class MainActivity : AppCompatActivity() {
         const val COMMAND_NEXT = "command_next"
         const val COMMAND_PREV = "command_prev"
 
-        // Optimization 3: Blocked Telemetry & Analytics Domains/Substrings
+        // Blocked Telemetry & Analytics Domains/Substrings
         private val BLOCKED_TELEMETRY_PATTERNS = listOf(
             "metrics.apple.com",
             "xp.apple.com",
@@ -290,9 +292,9 @@ class MainActivity : AppCompatActivity() {
             "/sentry/"
         )
 
-        // Optimization 2: Regex matching oversized mzstatic.com artwork (e.g. /1000x1000bb.jpg or /600x600bb.png)
+        // Regex matching mzstatic.com artwork dimensions
         private val MZSTATIC_ARTWORK_REGEX = Regex(
-            """/(\\d{3,4})x(\\d{3,4})([a-z]{0,4})\\.(jpg|jpeg|png|webp)(\\?.*)?$""",
+            """/(\\d{2,5})x(\\d{2,5})([a-z]{0,4})\\.(jpg|jpeg|png|webp)(\\?.*)?$""",
             RegexOption.IGNORE_CASE
         )
     }
@@ -355,10 +357,10 @@ class MainActivity : AppCompatActivity() {
         // Request POST_NOTIFICATIONS on Android 13+ (API 33+) for foreground media notification
         checkNotificationPermission()
 
-        // 3. Configure WebView for Maximum Performance, 500MB Cache & Light/Dark styling
+        // 3. Configure WebView with Full Browser Capabilities, 3rd-Party Cookies, Widevine DRM & 500MB Cache
         configureHighPerformanceWebView()
 
-        // 4. Setup Back-press handling to navigate WebView history
+        // 4. Setup Back-press handling to navigate WebView history without reload
         setupBackNavigation()
 
         // 5. Register Media Command Receiver
@@ -369,9 +371,14 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(mediaCommandReceiver, filter)
         }
 
-        // 6. Load Apple Music Beta
+        // 6. Load production Apple Music web player (normalizing any beta.music.apple.com link)
         if (savedInstanceState == null) {
-            val targetUrl = intent?.dataString ?: APPLE_MUSIC_BETA_URL
+            val incomingUrl = intent?.dataString
+            val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com")) {
+                incomingUrl.replace("beta.music.apple.com", "music.apple.com")
+            } else {
+                APPLE_MUSIC_URL
+            }
             webView.loadUrl(targetUrl)
         } else {
             webView.restoreState(savedInstanceState)
@@ -445,7 +452,6 @@ class MainActivity : AppCompatActivity() {
             lastRightInsetDp = (insets.right / density).toInt()
 
             val progressParams = progressBar.layoutParams as? FrameLayout.LayoutParams
-                ?: (progressBar.layoutParams as? androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams)
             progressParams?.topMargin = 0
             progressBar.layoutParams = progressParams
 
@@ -491,6 +497,7 @@ class MainActivity : AppCompatActivity() {
         applyAppCompatNightMode(mode)
         updateSystemBarsForCurrentTheme()
         applyWebViewTheme(mode)
+        injectUiAndMenuFixes()
     }
 
     private fun applyAppCompatNightMode(mode: String) {
@@ -510,20 +517,48 @@ class MainActivity : AppCompatActivity() {
 
         val settings = webView.settings
 
-        // 1. JavaScript & Storage
+        // 1. Full Browser Capabilities (JS, DOM Storage, Database, Viewport & Normal Layout)
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
+        @Suppress("DEPRECATION")
         settings.databaseEnabled = true
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+        settings.layoutAlgorithm = WebSettings.LayoutAlgorithm.NORMAL
 
-        // 2. 500 MB Dedicated OkHttp Disk Cache & WebView Cache Allocation
+        // 2. Mixed Content & Third-Party Cookies for Apple CDN (mzstatic.com) & MusicKit Auth
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        settings.loadsImagesAutomatically = true
+        settings.blockNetworkImage = false
+        settings.mediaPlaybackRequiresUserGesture = false
+        settings.setSupportMultipleWindows(false)
+        settings.allowFileAccess = false
+        settings.allowContentAccess = false
+
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.setAcceptCookie(true)
+        cookieManager.setAcceptThirdPartyCookies(webView, true)
+
+        // 3. 500 MB Dedicated OkHttp Disk Cache & Legacy v1.0.0 Cache Purge
         val customCacheDir = File(applicationContext.cacheDir, "music_beta_webview_cache")
         if (!customCacheDir.exists()) {
             customCacheDir.mkdirs()
         }
 
-        val okHttpCacheDir = File(applicationContext.cacheDir, "music_beta_okhttp_cache")
+        val okHttpCacheDir = File(applicationContext.cacheDir, "music_okhttp_cache_v3")
         if (!okHttpCacheDir.exists()) {
             okHttpCacheDir.mkdirs()
+        }
+
+        // Purge any v1.0.0/v1.0.1 cached downscaled 300x300 images so cards & banners load full-bleed
+        val savedSchema = sharedPreferences.getInt(KEY_CACHE_SCHEMA_VERSION, 1)
+        if (savedSchema < CACHE_SCHEMA_VERSION) {
+            try {
+                File(applicationContext.cacheDir, "music_beta_okhttp_cache").deleteRecursively()
+                File(applicationContext.cacheDir, "music_beta_okhttp_cache_v2").deleteRecursively()
+                webView.clearCache(true)
+            } catch (_: Exception) {}
+            sharedPreferences.edit().putInt(KEY_CACHE_SCHEMA_VERSION, CACHE_SCHEMA_VERSION).apply()
         }
 
         okHttpClient = OkHttpClient.Builder()
@@ -542,7 +577,6 @@ class MainActivity : AppCompatActivity() {
             }
             .build()
 
-        // Optimization 5: LOAD_DEFAULT with offline fallback to LOAD_CACHE_ELSE_NETWORK
         settings.cacheMode = if (isNetworkAvailable()) {
             WebSettings.LOAD_DEFAULT
         } else {
@@ -550,19 +584,14 @@ class MainActivity : AppCompatActivity() {
         }
         manageCacheQuota(customCacheDir, DISK_CACHE_MAX_BYTES)
 
-        // 3. Optimization 5: High Render Priority & Pre-Rasterization
         @Suppress("DEPRECATION")
         settings.setRenderPriority(WebSettings.RenderPriority.HIGH)
-        settings.offscreenPreRaster = true
-        settings.mediaPlaybackRequiresUserGesture = false
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-        settings.setSupportMultipleWindows(false)
-        settings.loadsImagesAutomatically = true
-        settings.allowFileAccess = false
-        settings.allowContentAccess = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            settings.offscreenPreRaster = true
+        }
 
-        // 4. iOS Safari User-Agent Override
-        settings.userAgentString = IOS_USER_AGENT
+        // 4. Modern Mobile Chrome User-Agent for standard mobile CSS & Widevine DRM
+        settings.userAgentString = MOBILE_CHROME_USER_AGENT
 
         // 5. Light/Dark Mode configuration on WebView
         applyWebViewTheme(currentThemeMode)
@@ -570,7 +599,7 @@ class MainActivity : AppCompatActivity() {
         // 6. JavaScript Interface for Media Session & Background Sync
         webView.addJavascriptInterface(MusicBridge(), "AndroidBridge")
 
-        // 7. Custom WebViewClient with shouldInterceptRequest & GPU CSS Injection
+        // 7. Custom WebViewClient & WebChromeClient (with Widevine DRM Permission Grant)
         setupWebViewClients()
     }
 
@@ -583,7 +612,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyWebViewTheme(mode: String) {
         val isDark = isEffectiveDarkMode()
-        val bgColor = if (isDark) Color.parseColor("#000000") else Color.parseColor("#FFFFFF")
+        val bgColor = if (isDark) Color.parseColor("#1F1F1F") else Color.parseColor("#FFFFFF")
         rootContainer.setBackgroundColor(bgColor)
         webView.setBackgroundColor(bgColor)
 
@@ -628,15 +657,16 @@ class MainActivity : AppCompatActivity() {
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 super.onPageCommitVisible(view, url)
                 injectSafeAreaInsetsScript()
-                injectGpuPerformanceCss()
+                injectUiAndMenuFixes()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 progressBar.visibility = View.GONE
+                CookieManager.getInstance().flush()
                 applyWebViewTheme(currentThemeMode)
                 injectSafeAreaInsetsScript()
-                injectGpuPerformanceCss()
+                injectUiAndMenuFixes()
                 injectAudioBridgeScript()
             }
 
@@ -647,20 +677,20 @@ class MainActivity : AppCompatActivity() {
                 val req = request ?: return null
                 val rawUrl = req.url?.toString() ?: return null
 
-                // Optimization 3: Block background tracking/metrics calls immediately
+                // Block background tracking/metrics calls immediately
                 if (isTelemetryOrTrackerUrl(rawUrl)) {
                     return createEmptyBlockedResponse()
                 }
 
-                // Only intercept GET requests for static asset caching & artwork optimization
+                // Only intercept GET requests for static asset caching
                 if (!req.method.equals("GET", ignoreCase = true)) {
                     return super.shouldInterceptRequest(view, request)
                 }
 
-                // Optimization 2: Rewrite oversized mzstatic.com album art to 300x300bb.webp
+                // Safe artwork URL handling: preserves native aspect ratios, .png cutouts & srcset density
                 val targetUrl = rewriteAppleArtworkUrl(rawUrl)
 
-                // Optimization 1: Cache static assets (.js, .css, .woff2, and mzstatic.com artwork) to disk
+                // Cache static assets (.js, .css, .woff2, and mzstatic.com artwork) to disk
                 if (isCacheableStaticAsset(targetUrl)) {
                     fetchFromOkHttpDiskCache(targetUrl, req)?.let { cachedResponse ->
                         return cachedResponse
@@ -679,7 +709,25 @@ class MainActivity : AppCompatActivity() {
 
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
-                return if (url.contains("music.apple.com")) false else false
+                val lower = url.lowercase()
+
+                // Block external native app deep links ("Open in Music" / itunes / market intents)
+                if (lower.startsWith("music://") ||
+                    lower.startsWith("itms://") ||
+                    lower.startsWith("itms-apps://") ||
+                    lower.startsWith("intent://") ||
+                    lower.contains("itunes.apple.com")
+                ) {
+                    return true
+                }
+
+                // Redirect any beta.music.apple.com navigation to stable music.apple.com
+                if (lower.contains("beta.music.apple.com")) {
+                    view?.loadUrl(url.replace("beta.music.apple.com", "music.apple.com", ignoreCase = true))
+                    return true
+                }
+
+                return false
             }
         }
 
@@ -688,6 +736,33 @@ class MainActivity : AppCompatActivity() {
                 progressBar.progress = newProgress
                 if (newProgress >= 100) {
                     progressBar.visibility = View.GONE
+                }
+            }
+
+            /**
+             * Requirement 4: Enable Widevine DRM Audio Playback.
+             * Automatically grants RESOURCE_PROTECTED_MEDIA_ID so MusicKit JS plays full songs
+             * with Widevine DRM instead of falling back to 30-second previews.
+             */
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                if (request == null) return
+                runOnUiThread {
+                    try {
+                        val requestedResources = request.resources ?: emptyArray()
+                        val granted = requestedResources.filter {
+                            it == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID ||
+                                it == PermissionRequest.RESOURCE_AUDIO_CAPTURE
+                        }.toTypedArray()
+
+                        if (granted.isNotEmpty()) {
+                            request.grant(granted)
+                            Log.i(TAG, "Granted WebChromeClient DRM permission: \${granted.joinToString()}")
+                        } else {
+                            request.grant(requestedResources)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error granting WebChromeClient permission", e)
+                    }
                 }
             }
 
@@ -717,16 +792,28 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    /**
+     * Safe Artwork URL handler:
+     * Never alters non-square banners (e.g. 580x132, 1080x540), transparent .png artist cutouts,
+     * or standard responsive srcset sizes (<= 600px) so genre cards and hero banners never squash.
+     */
     private fun rewriteAppleArtworkUrl(url: String): String {
         if (!url.contains("mzstatic.com", ignoreCase = true)) return url
         val match = MZSTATIC_ARTWORK_REGEX.find(url) ?: return url
         val width = match.groupValues[1].toIntOrNull() ?: return url
         val height = match.groupValues[2].toIntOrNull() ?: return url
+        val mode = match.groupValues[3].ifEmpty { "bb" }.lowercase()
         val ext = match.groupValues[4].lowercase()
         val query = match.groupValues[5]
 
-        if (width > 300 || height > 300 || ext != "webp") {
-            return url.replace(MZSTATIC_ARTWORK_REGEX, "/300x300bb.webp$query")
+        // Preserve all PNG cutouts, non-square aspect ratios, and special crop modes
+        if (ext == "png" || width != height || mode != "bb") {
+            return url
+        }
+
+        // Only cap ultra-large > 600x600 square album covers to 600x600bb.webp
+        if (width > 600) {
+            return url.replace(MZSTATIC_ARTWORK_REGEX, "/600x600bb.webp$query")
         }
         return url
     }
@@ -751,7 +838,7 @@ class MainActivity : AppCompatActivity() {
         return try {
             val requestBuilder = Request.Builder()
                 .url(targetUrl)
-                .header("User-Agent", IOS_USER_AGENT)
+                .header("User-Agent", MOBILE_CHROME_USER_AGENT)
 
             webRequest.requestHeaders["Accept"]?.let { requestBuilder.header("Accept", it) }
             webRequest.requestHeaders["Referer"]?.let { requestBuilder.header("Referer", it) }
@@ -811,26 +898,106 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun injectGpuPerformanceCss() {
-        val gpuCssScript = """
+    /**
+     * Requirement 3: Targeted CSS & DOM Fix for Opaque Navigation Menu & Clutter Removal.
+     * - Forces a solid opaque background (#ffffff in light mode / #1f1f1f in dark mode) on the navigation drawer/header
+     *   so opening the side menu never overlaps or shows home screen tiles underneath.
+     * - Removes any broken contain-intrinsic-size / content-visibility overrides so virtual scrolling has zero blank gaps.
+     * - Hides "Open in Music", "Exit Beta", and "Beta" badges via CSS + DOM MutationObserver.
+     */
+    private fun injectUiAndMenuFixes() {
+        val isDark = isEffectiveDarkMode()
+        val navBg = if (isDark) "#1f1f1f" else "#ffffff"
+        val textColor = if (isDark) "#ffffff" else "#000000"
+
+        val fixScript = """
             (function() {
-                if (document.getElementById('__music_beta_gpu_perf_css')) return;
-                const style = document.createElement('style');
-                style.id = '__music_beta_gpu_perf_css';
+                var navBg = '$navBg';
+                var textColor = '$textColor';
+                var styleId = '__music_wrapper_ui_fixes';
+                var style = document.getElementById(styleId);
+                if (!style) {
+                    style = document.createElement('style');
+                    style.id = styleId;
+                    (document.head || document.documentElement).appendChild(style);
+                }
                 style.textContent = [
-                    '/* 1. Strip expensive GPU Gaussian backdrop-filter blurs */',
-                    '*, *::before, *::after { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }',
-                    '.chrome-player, .web-navigation, .header-bar, [class*="backdrop"], [class*="blur"] { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; background-color: rgba(18, 18, 22, 0.96) !important; }',
-                    '/* 2. Hide "Open in Music App" upsell banners & promotional clutter */',
-                    '.upsell-banner, [data-testid="upsell-banner"], [class*="upsell"], [class*="open-in-app"], [class*="smart-banner"], .native-upsell, a[href*="itunes.apple.com"], button[aria-label*="Open in Music"] { display: none !important; height: 0 !important; max-height: 0 !important; visibility: hidden !important; pointer-events: none !important; overflow: hidden !important; }',
-                    '/* 3. Enable GPU hardware-accelerated scrolling & content-visibility */',
-                    'main, .scrollable-page, [class*="shelf"], [class*="grid"] { transform: translateZ(0); -webkit-overflow-scrolling: touch; will-change: transform; }',
-                    '.shelf-grid__item, .songs-list-row, [data-testid="track-lockup"], [class*="lockup"] { content-visibility: auto; contain-intrinsic-size: 1px 240px; }'
+                    '/* 1. Solid Opaque Navigation Drawer & Header */',
+                    '.navigation, .web-navigation, #navigation, [data-testid="navigation"], [class*="web-navigation"], .navigation__header, .navigation__content, .web-navigation__content, .web-navigation__list, .header-bar, header[role="banner"], nav[role="navigation"], nav[aria-label] {',
+                    '  background-color: ' + navBg + ' !important;',
+                    '  background: ' + navBg + ' !important;',
+                    '  color: ' + textColor + ' !important;',
+                    '  opacity: 1 !important;',
+                    '}',
+                    '.navigation, .web-navigation, #navigation, [data-testid="navigation"] {',
+                    '  z-index: 99999 !important;',
+                    '  padding-bottom: 112px !important;',
+                    '}',
+                    '/* 2. Hide Open in Music, Exit Beta, Beta badges & upsell banners */',
+                    '.upsell-banner, [data-testid="upsell-banner"], [data-testid*="exit-beta"], [class*="upsell"], [class*="smart-banner"], [class*="beta-badge"], .native-upsell, a[href*="itunes.apple.com"], a[href*="music://"], a[href*="itms://"], a[href*="beta.music.apple.com"], button[aria-label*="Open in Music"], button[aria-label*="Exit Beta"] {',
+                    '  display: none !important;',
+                    '  height: 0 !important;',
+                    '  max-height: 0 !important;',
+                    '  visibility: hidden !important;',
+                    '  pointer-events: none !important;',
+                    '  overflow: hidden !important;',
+                    '}'
                 ].join('\\n');
-                (document.head || document.documentElement).appendChild(style);
+
+                function enforceOpaqueMenuAndCleanLinks() {
+                    try {
+                        // Hide "Open in Music", "Exit Beta", and "Beta" badge elements by text content
+                        var nodes = document.querySelectorAll('a, button, li, span');
+                        for (var i = 0; i < nodes.length; i++) {
+                            var el = nodes[i];
+                            var txt = (el.textContent || '').trim().toLowerCase();
+                            if (txt === 'open in music' || txt === 'exit beta' || txt === 'open in music ↗' || txt === 'exit beta ↗' || (el.tagName === 'SPAN' && txt === 'beta')) {
+                                var row = el.closest('li') || el;
+                                row.style.setProperty('display', 'none', 'important');
+                            }
+                        }
+
+                        // Ensure any open navigation drawer container has a 100% solid opaque background
+                        var navContainers = document.querySelectorAll('.navigation, .web-navigation, #navigation, [data-testid="navigation"], nav, [role="navigation"], [class*="navigation"]');
+                        for (var j = 0; j < navContainers.length; j++) {
+                            var navEl = navContainers[j];
+                            navEl.style.setProperty('background-color', navBg, 'important');
+                            navEl.style.setProperty('background', navBg, 'important');
+                            navEl.style.setProperty('opacity', '1', 'important');
+                        }
+
+                        // Also walk up from the "Recently Added" / "All Playlists" menu items to guarantee the drawer wrapper is opaque
+                        for (var k = 0; k < nodes.length; k++) {
+                            var item = nodes[k];
+                            var itemTxt = (item.textContent || '').trim();
+                            if (itemTxt === 'Recently Added' || itemTxt === 'All Playlists') {
+                                var curr = item.parentElement;
+                                while (curr && curr !== document.body && curr !== document.documentElement) {
+                                    var tag = (curr.tagName || '').toUpperCase();
+                                    if (tag === 'MAIN') break;
+                                    if (curr.clientHeight > 220 && curr.clientWidth > 200) {
+                                        curr.style.setProperty('background-color', navBg, 'important');
+                                        curr.style.setProperty('background', navBg, 'important');
+                                        curr.style.setProperty('opacity', '1', 'important');
+                                    }
+                                    curr = curr.parentElement;
+                                }
+                            }
+                        }
+                    } catch (err) {}
+                }
+
+                enforceOpaqueMenuAndCleanLinks();
+                if (!window.__musicUiObserverInstalled) {
+                    window.__musicUiObserverInstalled = true;
+                    var obs = new MutationObserver(function() {
+                        enforceOpaqueMenuAndCleanLinks();
+                    });
+                    obs.observe(document.documentElement || document.body, { childList: true, subtree: true });
+                }
             })();
         """.trimIndent()
-        executeJavaScript(gpuCssScript)
+        executeJavaScript(fixScript)
     }
 
     private fun injectAudioBridgeScript() {
@@ -979,6 +1146,7 @@ class MainActivity : AppCompatActivity() {
         updateSystemBarsForCurrentTheme()
         applyWebViewTheme(currentThemeMode)
         injectSafeAreaInsetsScript()
+        injectUiAndMenuFixes()
     }
 
     override fun onPause() {
@@ -1519,25 +1687,25 @@ class MediaPlaybackService : Service() {
     path: 'app/src/main/res/layout/activity_main.xml',
     category: 'layout',
     language: 'xml',
-    description: 'Edge-to-edge root layout with hardware-accelerated WebView, indeterminate progress bar, and retry view.',
-    requirementTags: ['Core Requirement #1 & #4', 'fitsSystemWindows="false"', 'layerType="hardware"'],
+    description: 'Direct FrameLayout root (NO ScrollView/NestedScrollView) with match_parent hardware-accelerated WebView so Apple Music virtual scrolling calculates row heights accurately.',
+    requirementTags: ['Virtual Scroll Fix', 'No ScrollView Wrapper', 'match_parent WebView'],
     content: `<?xml version="1.0" encoding="utf-8"?>
-<androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/rootContainer"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000"
+    android:background="#FFFFFF"
     android:fitsSystemWindows="false"
     tools:context=".MainActivity">
 
-    <!-- High Performance Hardware-Accelerated Edge-to-Edge WebView -->
+    <!-- Direct match_parent WebView (never inside a ScrollView/NestedScrollView) for Virtual Scrolling -->
     <WebView
         android:id="@+id/webView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#000000"
+        android:background="#FFFFFF"
         android:fitsSystemWindows="false"
         android:layerType="hardware"
         android:overScrollMode="never"
@@ -1618,7 +1786,7 @@ class MediaPlaybackService : Service() {
         </LinearLayout>
     </FrameLayout>
 
-</androidx.coordinatorlayout.widget.CoordinatorLayout>`
+</FrameLayout>`
   },
   {
     id: 'github-workflow-release',

@@ -251,13 +251,15 @@ export function isTelemetryOrTrackerUrl(url: string): boolean {
 }
 
 /**
- * Optimization 2: Apple CDN Artwork Downscaler & WebP Rewriter.
- * Rewrites oversized mzstatic.com thumbnails (e.g., 1000x1000bb.jpg, 600x600bb.png, 1200x1200cc.jpg)
- * down to 300x300bb.webp to eliminate main-thread bitmap decoding stutter and cut bandwidth by ~88%.
+ * Optimization 2: Safe Apple CDN Artwork Downscaler & WebP Rewriter.
+ * - Preserves all .png images (transparent artist cutouts & title logos on Search category cards & hero banners).
+ * - Preserves all non-square aspect ratios (width !== height, e.g., 580x132, 684x156, 1080x540) and non-'bb' crop modes.
+ * - Only downscales oversized square 'bb' JPEG/WebP album covers (> 600x600) so <picture srcset> density,
+ *   hero banners ("Bollywood Hits"), and category tiles ("Bollywood", "Punjabi", "Pop") never shrink or lose transparency.
  */
 export function rewriteAppleArtworkUrl(
   url: string,
-  targetSpec: string = '300x300bb.webp'
+  targetSpec: string = '600x600bb.webp'
 ): {
   rewrittenUrl: string;
   wasRewritten: boolean;
@@ -267,8 +269,8 @@ export function rewriteAppleArtworkUrl(
     return { rewrittenUrl: url, wasRewritten: false, originalSpec: null };
   }
 
-  // Matches trailing dimension pattern like /1000x1000bb.jpg, /600x600bb.webp, /1400x1400sr.png
-  const artworkRegex = /\/(\d{3,4})x(\d{3,4})([a-z]{0,4})\.(jpg|jpeg|png|webp)(\?.*)?$/i;
+  // Matches trailing dimension pattern like /1000x1000bb.jpg, /600x600bb.webp, /580x132fn.png
+  const artworkRegex = /\/(\d{2,5})x(\d{2,5})([a-z]{0,4})\.(jpg|jpeg|png|webp)(\?.*)?$/i;
   const match = url.match(artworkRegex);
   if (!match) {
     return { rewrittenUrl: url, wasRewritten: false, originalSpec: null };
@@ -276,13 +278,19 @@ export function rewriteAppleArtworkUrl(
 
   const width = parseInt(match[1], 10);
   const height = parseInt(match[2], 10);
-  const mode = match[3] || 'bb';
-  const ext = match[4];
+  const mode = (match[3] || 'bb').toLowerCase();
+  const ext = match[4].toLowerCase();
   const query = match[5] || '';
   const originalSpec = `${width}x${height}${mode}.${ext}`;
 
-  // Rewrite if dimensions exceed 300px or if format is not already webp at <=300px
-  if (width > 300 || height > 300 || ext.toLowerCase() !== 'webp') {
+  // 1. Never rewrite .png (transparent cutouts/logos on category tiles & hero banners)
+  // 2. Never rewrite non-square banners (width !== height) or special crop modes (mode !== 'bb')
+  if (ext === 'png' || width !== height || mode !== 'bb') {
+    return { rewrittenUrl: url, wasRewritten: false, originalSpec };
+  }
+
+  // 3. Only rewrite oversized square 'bb' thumbnails (> 600px)
+  if (width > 600) {
     const rewrittenUrl = url.replace(artworkRegex, `/${targetSpec}${query}`);
     return {
       rewrittenUrl,
@@ -309,44 +317,65 @@ export function isCacheableStaticAsset(url: string): boolean {
 }
 
 /**
- * Optimization 4: CSS GPU Performance Injection.
- * Strips heavy real-time backdrop-filter blurs, hides "Open in Music App" promotional banners,
- * and promotes scrollable shelves & track lockups to GPU-accelerated layers with content-visibility: auto.
+ * Optimization 4: Safe CSS GPU Performance & Layout Protection Injection.
+ * - Ensures mobile navigation drawer (.navigation / .web-navigation) has a solid opaque background,
+ *   z-index: 9999 (so shelves never bleed through), and bottom padding to clear the mini-player.
+ * - Avoids forcing contain-intrinsic-size: 240px on [class*="lockup"] (which caused 240px white gaps between 56px song rows).
+ * - Avoids forcing transform: translateZ(0) on [class*="shelf"] / [class*="grid"] (which broke stacking contexts over the menu).
+ * - Ensures square artwork-component images fill 100% of their frame regardless of srcset density.
  */
-export function generateGpuPerformanceCss(): string {
+export function generateGpuPerformanceCss(isDark: boolean = false): string {
+  const navBg = isDark ? '#1f1f1f' : '#ffffff';
+  const textColor = isDark ? '#ffffff' : '#000000';
   return `
-    /* 1. Strip expensive GPU Gaussian backdrop-filter blurs that cause scroll frame drops */
-    *, *::before, *::after {
-      backdrop-filter: none !important;
-      -webkit-backdrop-filter: none !important;
+    /* 1. Solid Opaque Mobile Navigation Drawer & Header (Fixes transparent overlapping side menu) */
+    .navigation,
+    .web-navigation,
+    #navigation,
+    [data-testid="navigation"],
+    [class*="web-navigation"],
+    .navigation__header,
+    .navigation__content,
+    .header-bar,
+    header[role="banner"],
+    nav[ role="navigation" ],
+    nav[aria-label] {
+      background-color: ${navBg} !important;
+      background: ${navBg} !important;
+      color: ${textColor} !important;
+      opacity: 1 !important;
+      z-index: 99999 !important;
     }
-    .chrome-player, .web-navigation, .header-bar, [class*="backdrop"], [class*="blur"] {
-      backdrop-filter: none !important;
-      -webkit-backdrop-filter: none !important;
-      background-color: rgba(18, 18, 22, 0.96) !important;
+    .navigation, .web-navigation, [data-testid="navigation"] {
+      padding-bottom: 112px !important;
     }
 
-    /* 2. Hide "Open in Music App" upsell banners & web promotional clutter */
-    .upsell-banner, [data-testid="upsell-banner"], [class*="upsell"],
-    [class*="open-in-app"], [class*="smart-banner"], .native-upsell,
-    a[href*="itunes.apple.com"], button[aria-label*="Open in Music"] {
+    /* 2. Strip expensive backdrop-filter blurs on scrolling shelf cards only */
+    .shelf-grid__item *, .songs-list-row * {
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
+
+    /* 3. Hide "Open in Music", "Exit Beta", Beta badge, and promotional smart-banners */
+    .upsell-banner,
+    [data-testid="upsell-banner"],
+    [data-testid*="exit-beta"],
+    [class*="upsell"],
+    [class*="smart-banner"],
+    [class*="beta-badge"],
+    .native-upsell,
+    a[href*="itunes.apple.com"],
+    a[href*="music://"],
+    a[href*="itms://"],
+    a[href*="exit-beta"],
+    button[aria-label*="Open in Music"],
+    button[aria-label*="Exit Beta"] {
       display: none !important;
       height: 0 !important;
       max-height: 0 !important;
       visibility: hidden !important;
       pointer-events: none !important;
       overflow: hidden !important;
-    }
-
-    /* 3. Enable hardware-accelerated scrolling & offscreen layout skipping */
-    main, .scrollable-page, [class*="shelf"], [class*="grid"] {
-      transform: translateZ(0);
-      -webkit-overflow-scrolling: touch;
-      will-change: transform;
-    }
-    .shelf-grid__item, .songs-list-row, [data-testid="track-lockup"], [class*="lockup"] {
-      content-visibility: auto;
-      contain-intrinsic-size: 1px 240px;
     }
   `.trim();
 }
