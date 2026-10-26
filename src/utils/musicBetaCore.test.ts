@@ -228,6 +228,14 @@ test('getAppleSignatureAudioConfig and generateAppleSignatureWebAudioScript conf
   const script = generateAppleSignatureWebAudioScript();
   assert.ok(script.includes("localStorage.setItem('music.ampwebplay.bitrate', '256')"));
   assert.ok(script.includes('MusicKit.PlaybackBitrate.HIGH'));
+
+  const { PROJECT_FILES } = await import('../data/projectFiles');
+  const mainActivity = PROJECT_FILES.find((f) => f.path.endsWith('MainActivity.kt'));
+  assert.ok(mainActivity);
+  assert.ok(mainActivity.content.includes('DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION'));
+  assert.ok(!mainActivity.content.includes('DynamicsProcessing.Config.VARIANT_FAVOR_FREQUENCY_RESOLUTION'));
+  assert.ok(mainActivity.content.includes('setEnabled(true)'));
+  assert.ok(mainActivity.content.includes('dynamicsProcessing?.setEnabled(false)'));
 });
 
 
