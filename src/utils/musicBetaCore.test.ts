@@ -162,10 +162,17 @@ test('isCacheableStaticAsset identifies .js, .css, .woff2, and mzstatic artwork 
   assert.equal(isCacheableStaticAsset('https://metrics.apple.com/tracker.js'), false);
 });
 
-test('generateGpuPerformanceCss and generateSpaBackNavigationScript protect navigation menu and song row heights', () => {
+test('generateGpuPerformanceCss and generateSpaBackNavigationScript protect navigation menu, search header, and song row heights', async () => {
+  const { APPLE_MUSIC_BETA_URL, normalizeAppleMusicBetaUrl } = await import('./musicBetaCore');
+  assert.equal(APPLE_MUSIC_BETA_URL, 'https://beta.music.apple.com');
+  assert.equal(normalizeAppleMusicBetaUrl('https://music.apple.com/in/search'), 'https://beta.music.apple.com/in/search');
+  assert.equal(normalizeAppleMusicBetaUrl('https://beta.music.apple.com/us/browse'), 'https://beta.music.apple.com/us/browse');
+  assert.equal(normalizeAppleMusicBetaUrl(''), 'https://beta.music.apple.com');
+
   const lightCss = generateGpuPerformanceCss(false);
   assert.ok(lightCss.includes('background-color: #ffffff !important'));
-  assert.ok(lightCss.includes('z-index: 99999 !important'));
+  assert.ok(lightCss.includes('z-index: 9999 !important'));
+  assert.ok(lightCss.includes('touch-action: pan-y !important'));
   assert.ok(!lightCss.includes('contain-intrinsic-size: 1px 240px'));
 
   const darkCss = generateGpuPerformanceCss(true);
@@ -199,4 +206,28 @@ test('parseGitHubRepoInput and buildGitTreeItems normalize GitHub repository inp
   assert.equal(tree[0].path, 'app/build.gradle.kts');
   assert.equal(tree[1].path, '.github/workflows/release.yml');
 });
+
+test('getAppleSignatureAudioConfig and generateAppleSignatureWebAudioScript configure 256kbps AAC, 5-band Session 0 DSP, and Bit-Perfect USB DAC', async () => {
+  const { getAppleSignatureAudioConfig, generateAppleSignatureWebAudioScript } = await import('./musicBetaCore');
+  const cfg = getAppleSignatureAudioConfig();
+  assert.equal(cfg.sessionId, 0);
+  assert.equal(cfg.targetBitrateKbps, 256);
+  assert.equal(cfg.bands.length, 5);
+  assert.equal(cfg.bands[0].netGainDb, 2.0);
+  assert.equal(cfg.bands[1].netGainDb, -0.5);
+  assert.equal(cfg.bands[3].netGainDb, 1.0);
+  assert.equal(cfg.bands[4].netGainDb, 2.2);
+  assert.equal(cfg.limiter.thresholdDb, -1.0);
+  assert.equal(cfg.limiter.attackTimeMs, 2.0);
+  assert.equal(cfg.limiter.releaseTimeMs, 60.0);
+  assert.equal(cfg.limiter.ratio, 4.0);
+  assert.equal(cfg.usbBitPerfect.sampleRateHz, 44100);
+  assert.equal(cfg.usbBitPerfect.encoding, 'ENCODING_PCM_FLOAT');
+  assert.equal(cfg.usbBitPerfect.mixerBehavior, 'MIXER_BEHAVIOR_BIT_PERFECT');
+
+  const script = generateAppleSignatureWebAudioScript();
+  assert.ok(script.includes("localStorage.setItem('music.ampwebplay.bitrate', '256')"));
+  assert.ok(script.includes('MusicKit.PlaybackBitrate.HIGH'));
+});
+
 

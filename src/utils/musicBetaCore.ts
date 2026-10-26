@@ -316,38 +316,65 @@ export function isCacheableStaticAsset(url: string): boolean {
   return /\.(js|mjs|css|woff2|woff|ttf|otf|webp|png|jpg|jpeg|svg|ico)$/.test(lower);
 }
 
+export const APPLE_MUSIC_BETA_URL = 'https://beta.music.apple.com';
+
 /**
- * Optimization 4: Safe CSS GPU Performance & Layout Protection Injection.
- * - Ensures mobile navigation drawer (.navigation / .web-navigation) has a solid opaque background,
- *   z-index: 9999 (so shelves never bleed through), and bottom padding to clear the mini-player.
- * - Avoids forcing contain-intrinsic-size: 240px on [class*="lockup"] (which caused 240px white gaps between 56px song rows).
- * - Avoids forcing transform: translateZ(0) on [class*="shelf"] / [class*="grid"] (which broke stacking contexts over the menu).
- * - Ensures square artwork-component images fill 100% of their frame regardless of srcset density.
+ * Normalizes any Apple Music URL so it always targets Apple Music Web Player Beta (https://beta.music.apple.com).
+ */
+export function normalizeAppleMusicBetaUrl(url?: string | null): string {
+  const trimmed = (url || '').trim();
+  if (!trimmed || !trimmed.toLowerCase().includes('music.apple.com')) {
+    return APPLE_MUSIC_BETA_URL;
+  }
+  return trimmed.replace(/^https?:\/\/(www\.)?music\.apple\.com/i, APPLE_MUSIC_BETA_URL);
+}
+
+/**
+ * Optimization 4: Safe CSS GPU Performance & Layout Protection Injection for beta.music.apple.com.
+ * - Ensures mobile navigation drawer (.navigation / .web-navigation) has a solid opaque background
+ *   without adding 112px bottom padding to the closed top header bar (which previously clipped the "Search" heading).
+ * - Applies bottom clearance padding only to the expanded menu list and main scrollable page container
+ *   so content clears the floating bottom mini-player.
+ * - Hides "Open in Music" and "Exit Beta" links so users remain inside Apple Music Web Player Beta.
  */
 export function generateGpuPerformanceCss(isDark: boolean = false): string {
   const navBg = isDark ? '#1f1f1f' : '#ffffff';
   const textColor = isDark ? '#ffffff' : '#000000';
   return `
-    /* 1. Solid Opaque Mobile Navigation Drawer & Header (Fixes transparent overlapping side menu) */
+    /* 1. Solid Opaque Mobile Navigation Header & Open Drawer (No closed-header padding-bottom clipping) */
     .navigation,
     .web-navigation,
     #navigation,
     [data-testid="navigation"],
-    [class*="web-navigation"],
     .navigation__header,
     .navigation__content,
+    .web-navigation__content,
+    .web-navigation__list,
     .header-bar,
     header[role="banner"],
-    nav[ role="navigation" ],
-    nav[aria-label] {
+    nav[role="navigation"] {
       background-color: ${navBg} !important;
       background: ${navBg} !important;
       color: ${textColor} !important;
       opacity: 1 !important;
-      z-index: 99999 !important;
+      z-index: 9999 !important;
     }
-    .navigation, .web-navigation, [data-testid="navigation"] {
+
+    /* Apply bottom clearance ONLY to the inner expanded menu list & scrollable page (never the closed top header bar) */
+    .web-navigation__list,
+    .navigation__content,
+    .web-navigation__drawer {
       padding-bottom: 112px !important;
+    }
+
+    /* Ensure smooth vertical touch scrolling & bottom mini-player clearance on main content */
+    html, body, main, .scrollable-page, [class*="scrollable-page"] {
+      overflow-y: auto !important;
+      -webkit-overflow-scrolling: touch !important;
+      touch-action: pan-y !important;
+    }
+    main, .scrollable-page, [class*="scrollable-page"] {
+      padding-bottom: 96px !important;
     }
 
     /* 2. Strip expensive backdrop-filter blurs on scrolling shelf cards only */
@@ -356,13 +383,12 @@ export function generateGpuPerformanceCss(isDark: boolean = false): string {
       -webkit-backdrop-filter: none !important;
     }
 
-    /* 3. Hide "Open in Music", "Exit Beta", Beta badge, and promotional smart-banners */
+    /* 3. Hide "Open in Music", "Exit Beta", and native app upsell banners while keeping Beta Web Player active */
     .upsell-banner,
     [data-testid="upsell-banner"],
     [data-testid*="exit-beta"],
     [class*="upsell"],
     [class*="smart-banner"],
-    [class*="beta-badge"],
     .native-upsell,
     a[href*="itunes.apple.com"],
     a[href*="music://"],
@@ -479,6 +505,84 @@ export function buildGitTreeItems(files: GitTreeItemInput[]): GitHubTreeEntry[] 
   }
 
   return entries;
+}
+
+export interface AppleSignatureAudioBand {
+  index: number;
+  label: string;
+  cutoffHz: number;
+  preEqGainDb: number;
+  postEqGainDb: number;
+  netGainDb: number;
+}
+
+export interface AppleSignatureAudioConfig {
+  sessionId: number;
+  channelCount: number;
+  targetBitrateKbps: number;
+  bands: AppleSignatureAudioBand[];
+  limiter: {
+    attackTimeMs: number;
+    releaseTimeMs: number;
+    ratio: number;
+    thresholdDb: number;
+    postGainDb: number;
+  };
+  usbBitPerfect: {
+    sampleRateHz: number;
+    encoding: 'ENCODING_PCM_FLOAT';
+    mixerBehavior: 'MIXER_BEHAVIOR_BIT_PERFECT';
+  };
+}
+
+export function getAppleSignatureAudioConfig(): AppleSignatureAudioConfig {
+  return {
+    sessionId: 0,
+    channelCount: 2,
+    targetBitrateKbps: 256,
+    bands: [
+      { index: 0, label: 'Sub-bass warmth (<80Hz)', cutoffHz: 80.0, preEqGainDb: 2.0, postEqGainDb: 0.0, netGainDb: 2.0 },
+      { index: 1, label: 'Lower-mids clarity (250Hz)', cutoffHz: 250.0, preEqGainDb: -0.5, postEqGainDb: 0.0, netGainDb: -0.5 },
+      { index: 2, label: 'Reference midrange (1kHz)', cutoffHz: 1000.0, preEqGainDb: 0.0, postEqGainDb: 0.0, netGainDb: 0.0 },
+      { index: 3, label: 'Vocal presence (3.5kHz)', cutoffHz: 3500.0, preEqGainDb: 0.0, postEqGainDb: 1.0, netGainDb: 1.0 },
+      { index: 4, label: 'High-resolution Air (>12kHz)', cutoffHz: 20000.0, preEqGainDb: 0.0, postEqGainDb: 2.2, netGainDb: 2.2 },
+    ],
+    limiter: {
+      attackTimeMs: 2.0,
+      releaseTimeMs: 60.0,
+      ratio: 4.0,
+      thresholdDb: -1.0,
+      postGainDb: 0.0,
+    },
+    usbBitPerfect: {
+      sampleRateHz: 44100,
+      encoding: 'ENCODING_PCM_FLOAT',
+      mixerBehavior: 'MIXER_BEHAVIOR_BIT_PERFECT',
+    },
+  };
+}
+
+export function generateAppleSignatureWebAudioScript(): string {
+  return `(function() {
+    if (window.__appleSignatureAudioInjected) return;
+    window.__appleSignatureAudioInjected = true;
+    try { localStorage.setItem('music.ampwebplay.bitrate', '256'); } catch (_) {}
+    var attempts = 0;
+    var timer = setInterval(function() {
+      attempts++;
+      try {
+        if (window.MusicKit && typeof window.MusicKit.getInstance === 'function') {
+          var music = window.MusicKit.getInstance();
+          if (music) {
+            music.bitrate = (window.MusicKit.PlaybackBitrate && window.MusicKit.PlaybackBitrate.HIGH !== undefined)
+              ? window.MusicKit.PlaybackBitrate.HIGH : 256;
+            clearInterval(timer);
+          }
+        }
+      } catch (_) {}
+      if (attempts > 60) clearInterval(timer);
+    }, 1000);
+  })();`;
 }
 
 

@@ -103,17 +103,17 @@ zipStorePath=wrapper/dists
 
       zip.file(
         'README.md',
-        `# MusicBetaWrapper (Android 14+)
+        `# MusicBetaWrapper (Android 14+ • v1.1.0)
 
-High-performance native Android wrapper around \`https://beta.music.apple.com\`.
+High-performance native Android wrapper around \`https://beta.music.apple.com\` with Apple Signature Sound DSP & Bit-Perfect USB DAC output.
 
-## Features
-- **120 Hz+ Refresh Rate**: Forced peak display refresh rate.
-- **Screen-Off Audio**: Ongoing MediaPlayback ForegroundService with wake & Wi-Fi locks.
-- **500 MB Dedicated Cache**: Fast offline buffer.
-- **iOS Safari User-Agent**: Renders native Apple Music mobile interface.
-- **Dynamic Light & Dark Modes**: Dynamic system bar tinting & WebKit theme sync.
-- **Automated CI/CD**: \`.github/workflows/release.yml\` builds and publishes APKs on tag push.
+## Key Features
+- **Widevine DRM & 256kbps AAC**: Automatic \`RESOURCE_PROTECTED_MEDIA_ID\` grant + \`MusicKit.PlaybackBitrate.HIGH\` (\`256kbps\`) injection.
+- **32-Bit Float Web Audio & Native Android DSP (\`AppleSignatureAudioEngine\`)**: 5-band \`DynamicsProcessing\` Pre-EQ/Post-EQ (<80Hz +2.0dB, 250Hz -0.5dB, 3.5kHz +1.0dB, >12kHz +2.2dB) and hardware \`-1.0dBFS\` brickwall limiter on global output mix (Session 0).
+- **Android 14+ (API 34+) Bit-Perfect USB DAC Bypass**: Automatic \`AudioDeviceCallback\` configuring \`MIXER_BEHAVIOR_BIT_PERFECT\` for wired USB headsets/DACs.
+- **Fixed WebView Layout & Opaque Menu**: Direct \`match_parent\` \`WebView\` (no \`ScrollView\` clipping), hardware acceleration, and solid opaque navigation drawer.
+- **120 Hz+ Refresh Rate & Screen-Off Audio**: Ongoing \`MediaPlaybackService\` foreground service with wake & Wi-Fi locks.
+- **Automated CI/CD**: \`.github/workflows/release.yml\` builds and signs release APKs automatically on push.
 
 ## Build Instructions
 \`\`\`bash

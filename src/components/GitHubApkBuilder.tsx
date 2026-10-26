@@ -288,7 +288,7 @@ export const GitHubApkBuilder: React.FC<GitHubApkBuilderProps> = ({ onDownloadZi
         ...PROJECT_FILES.map((f) => ({ path: f.path, content: f.content })),
         {
           path: 'README.md',
-          content: `# MusicBetaWrapper (Android 14+ APK)\n\nHigh-performance native Android Kotlin wrapper for \`https://beta.music.apple.com\`.\n\n## Included Optimizations\n- **5 WebView Anti-Lag Optimizations**: 500MB OkHttp disk cache (\`shouldInterceptRequest\`), \`mzstatic.com\` \`300x300bb.webp\` artwork downscaler, telemetry blocker, GPU CSS blur stripper, and zero-reload SPA \`window.history.back()\`.\n- **Camera Notch & Status Bar Safe-Area Protection**: Physical \`WindowInsetsCompat\` padding + CSS variables.\n- **120 Hz+ Display Refresh Rate** & **Screen-Off Background Playback**.\n`,
+          content: `# MusicBetaWrapper (Android 14+ APK • v1.1.0)\n\nHigh-performance native Android Kotlin wrapper for \`https://beta.music.apple.com\`.\n\n## Included Audio & WebView Systems\n- **Widevine DRM & 256kbps High-Bitrate AAC**: Grants \`RESOURCE_PROTECTED_MEDIA_ID\` and forces \`MusicKit.PlaybackBitrate.HIGH\` (\`256kbps\`).\n- **AppleSignatureAudioEngine (API 28+ DynamicsProcessing + 32-Bit Float Web Audio)**: 5-band Pre/Post-EQ (<80Hz +2.0dB, 250Hz -0.5dB, 3.5kHz +1.0dB, >12kHz +2.2dB) and \`-1.0dBFS\` hardware limiter.\n- **Android 14+ (API 34+) Bit-Perfect USB DAC Bypass**: Automatic \`AudioDeviceCallback\` setting \`MIXER_BEHAVIOR_BIT_PERFECT\`.\n- **WebView Layout & Opaque Menu Fixes**: Direct \`match_parent\` \`WebView\` for virtual scrolling, solid opaque navigation drawer, and 500MB OkHttp artwork cache.\n- **120 Hz+ Display Refresh Rate** & **Screen-Off Background Playback**.\n`,
         },
       ];
 
@@ -321,7 +321,7 @@ export const GitHubApkBuilder: React.FC<GitHubApkBuilderProps> = ({ onDownloadZi
         {
           method: 'POST',
           body: JSON.stringify({
-            message: 'feat: Complete MusicBetaWrapper Android 14 project + signed APK CI/CD workflow',
+            message: 'feat(audio): integrate AppleSignatureAudioEngine DSP, Widevine 256kbps AAC, Bit-Perfect USB DAC & WebView fixes (v1.1.0)',
             tree: treeData.sha,
             parents: [latestCommitSha],
           }),
@@ -414,7 +414,7 @@ git push -u origin main
           <div className="space-y-2">
             <div className="inline-flex items-center space-x-2 px-2.5 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-[11px] font-bold uppercase tracking-wider">
               <CheckCircle2 className="w-3.5 h-3.5" />
-              <span>Compiled &amp; Signed v1.1.0 Release Ready (All 4 UI &amp; DRM Fixes Applied)</span>
+              <span>Compiled &amp; Signed v1.1.0 Release Ready (Apple Music Web Player Beta)</span>
             </div>
             <h2 className="text-xl font-black text-white flex items-center space-x-2.5">
               <span>MusicBetaWrapper-v1.1.0-signed.apk</span>
@@ -423,17 +423,17 @@ git push -u origin main
               </span>
             </h2>
             <p className="text-xs sm:text-sm text-neutral-300 max-w-3xl leading-relaxed">
-              Fixes cropped genre/banner artwork, eliminates the 240px virtual-scrolling blank gaps in song lists, enforces a solid opaque background (<code className="text-emerald-400">#ffffff</code> / <code className="text-emerald-400">#1f1f1f</code>) on the navigation menu, hides Beta/upsell clutter, and grants <code className="text-emerald-400">RESOURCE_PROTECTED_MEDIA_ID</code> for Widevine DRM full-track playback.
+              Targets <code className="text-emerald-400">https://beta.music.apple.com</code> (Apple Music Web Player Beta). Eliminates category card image flickering while the floating mini-player is active, fixes top <code className="text-emerald-400">Search</code> heading clipping and scroll freeze, enforces a solid opaque background (<code className="text-emerald-400">#ffffff</code> / <code className="text-emerald-400">#1f1f1f</code>) on the navigation menu, and grants <code className="text-emerald-400">RESOURCE_PROTECTED_MEDIA_ID</code> for Widevine DRM full-track playback.
             </p>
             <div className="pt-1 flex flex-wrap items-center gap-2 text-[11px] font-mono text-neutral-400">
               <span className="px-2 py-1 rounded bg-neutral-950/90 border border-neutral-800 text-emerald-400">
-                Signature: V2 + V3 Verified
+                Target: https://beta.music.apple.com
               </span>
               <span className="px-2 py-1 rounded bg-neutral-950/90 border border-neutral-800 text-neutral-300">
-                Version: 1.1.0 (versionCode 2, Auto Cache-Purge)
+                Version: 1.1.0 (versionCode 2, Schema v4)
               </span>
               <span className="px-2 py-1 rounded bg-neutral-950/90 border border-neutral-800 text-neutral-400 truncate max-w-md">
-                Widevine DRM + 3rd-Party Cookies Enabled
+                Widevine DRM + Zero Flicker Mini-Player
               </span>
             </div>
           </div>

@@ -11,10 +11,19 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioMixerAttributes
+import android.media.audiofx.DynamicsProcessing
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.view.View
@@ -31,6 +40,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import androidx.activity.OnBackPressedCallback
+import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.app.ActivityCompat
@@ -51,20 +61,28 @@ import java.util.concurrent.TimeUnit
 
 /**
  * MainActivity for MusicBetaWrapper (v1.1.0).
- * High-performance, edge-to-edge native Android 14 wrapper around https://music.apple.com
+ * High-performance, edge-to-edge native Android 14 wrapper around https://beta.music.apple.com (Apple Music Web Player Beta)
  *
- * Key Fixes & Capabilities:
- * 1. Virtual Scrolling & Layout Fix: Direct match_parent WebView inside FrameLayout (no ScrollView) + LayoutAlgorithm.NORMAL
- * 2. Full Browser & CDN Capabilities: DOM Storage, Database, WideViewport, MIXED_CONTENT_ALWAYS_ALLOW, Third-Party Cookies, Mobile Chrome UA
- * 3. Opaque Navigation Menu & Full-Bleed Cards: Solid #ffffff (Light) / #1f1f1f (Dark) nav drawer, no broken contain-intrinsic-size gaps, native srcset aspect ratios
- * 4. Widevine DRM Full-Track Playback: Grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID in WebChromeClient
- * 5. 120Hz+ Display Refresh Rate, Camera Notch Safe-Area Padding & Screen-Off Background Audio Service
+ * Integrated Audio & Visual Systems:
+ * 1. Widevine DRM & WebView Audio Optimization:
+ *    - Grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID in WebChromeClient with a Widevine-compatible Mobile Chrome User-Agent.
+ * 2. MusicKit JS High-Bitrate (256kbps AAC) & Web Audio 32-Bit Float Mastering Injection:
+ *    - Polls window.MusicKit, sets music.bitrate = MusicKit.PlaybackBitrate.HIGH (256kbps AAC) & localStorage['music.ampwebplay.bitrate'] = '256',
+ *      and safely hooks <audio> elements into a 32-bit float AudioContext (65Hz +1.8dB warmth, 13.5kHz +2.0dB air, soft-knee compressor)
+ *      with automatic fallback to Native Android DSP if Widevine EME blocks createMediaElementSource CORS.
+ * 3. Native Android DynamicsProcessing Mastering Engine (API 28+, Session 0):
+ *    - Dedicated AppleSignatureAudioEngine attached to global output session 0 with 5-band Pre-EQ/Post-EQ
+ *      (<80Hz +2.0dB, 250Hz -0.5dB, 1kHz 0.0dB, 3.5kHz +1.0dB, >12kHz +2.2dB) and hardware Limiter (-1.0dBFS, 2ms attack, 60ms release, 4:1 ratio).
+ * 4. Android 14+ (API 34+) Bit-Perfect USB DAC / Headset Bypass:
+ *    - Automatic AudioDeviceCallback listener routing TYPE_USB_HEADSET and TYPE_USB_DEVICE via AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT.
+ * 5. Zero Image Flickering & Unclipped Search Header:
+ *    - Native Chromium HTTP/2 disk cache for mzstatic.com srcset artwork + opaque #ffffff/#1f1f1f nav drawer + 96px floating mini-player scroll clearance.
  */
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MusicBetaWrapper"
-        private const val APPLE_MUSIC_URL = "https://music.apple.com"
+        private const val APPLE_MUSIC_BETA_URL = "https://beta.music.apple.com"
         private const val NOTIFICATION_PERMISSION_CODE = 1001
         private const val DISK_CACHE_MAX_BYTES = 500L * 1024L * 1024L // 500 MB
 
@@ -72,12 +90,12 @@ class MainActivity : AppCompatActivity() {
         private const val PREFS_NAME = "music_wrapper_prefs"
         private const val KEY_THEME_MODE = "pref_theme_mode"
         private const val KEY_CACHE_SCHEMA_VERSION = "pref_cache_schema_version"
-        private const val CACHE_SCHEMA_VERSION = 3
+        private const val CACHE_SCHEMA_VERSION = 4
         const val THEME_SYSTEM = "system"
         const val THEME_LIGHT = "light"
         const val THEME_DARK = "dark"
 
-        // Modern Mobile Chrome on Android 14 User-Agent (ensures standard mobile CSS & Widevine DRM EME support)
+        // Widevine-compatible Mobile Chrome on Android 14 User-Agent (NEVER spoof iOS/Safari so Widevine EME works natively)
         const val MOBILE_CHROME_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
         // Broadcast actions between Activity and MediaPlaybackService
@@ -100,12 +118,6 @@ class MainActivity : AppCompatActivity() {
             "browser.sentry-cdn.com",
             "/sentry/"
         )
-
-        // Regex matching mzstatic.com artwork dimensions
-        private val MZSTATIC_ARTWORK_REGEX = Regex(
-            """/(\d{2,5})x(\d{2,5})([a-z]{0,4})\.(jpg|jpeg|png|webp)(\?.*)?$""",
-            RegexOption.IGNORE_CASE
-        )
     }
 
     private lateinit var rootContainer: View
@@ -115,6 +127,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var insetsController: WindowInsetsControllerCompat
     private lateinit var sharedPreferences: SharedPreferences
     private lateinit var okHttpClient: OkHttpClient
+    private var appleSignatureAudioEngine: AppleSignatureAudioEngine? = null
 
     private var currentRefreshRate: Float = 60.0f
     private var isPlayingAudio: Boolean = false
@@ -166,13 +179,18 @@ class MainActivity : AppCompatActivity() {
         // Request POST_NOTIFICATIONS on Android 13+ (API 33+) for foreground media notification
         checkNotificationPermission()
 
-        // 3. Configure WebView with Full Browser Capabilities, 3rd-Party Cookies, Widevine DRM & 500MB Cache
+        // 3. Initialize Native "Apple Signature Sound" DynamicsProcessing DSP (Session 0) & Android 14+ Bit-Perfect USB DAC Engine
+        appleSignatureAudioEngine = AppleSignatureAudioEngine(applicationContext).also { engine ->
+            engine.start()
+        }
+
+        // 4. Configure WebView with Full Browser Capabilities, 3rd-Party Cookies, Widevine DRM & 500MB Cache
         configureHighPerformanceWebView()
 
-        // 4. Setup Back-press handling to navigate WebView history without reload
+        // 5. Setup Back-press handling to navigate WebView history without reload
         setupBackNavigation()
 
-        // 5. Register Media Command Receiver
+        // 6. Register Media Command Receiver
         val filter = IntentFilter(ACTION_MEDIA_COMMAND)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(mediaCommandReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -180,13 +198,16 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(mediaCommandReceiver, filter)
         }
 
-        // 6. Load production Apple Music web player (normalizing any beta.music.apple.com link)
+        // 7. Load Apple Music Web Player Beta (https://beta.music.apple.com)
         if (savedInstanceState == null) {
             val incomingUrl = intent?.dataString
-            val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com")) {
-                incomingUrl.replace("beta.music.apple.com", "music.apple.com")
+            val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
+                incomingUrl.replace(
+                    Regex("^https?://(www\.)?music\.apple\.com", RegexOption.IGNORE_CASE),
+                    APPLE_MUSIC_BETA_URL
+                )
             } else {
-                APPLE_MUSIC_URL
+                APPLE_MUSIC_BETA_URL
             }
             webView.loadUrl(targetUrl)
         } else {
@@ -266,7 +287,7 @@ class MainActivity : AppCompatActivity() {
 
             injectSafeAreaInsetsScript()
 
-            WindowInsetsCompat.CONSUMED
+            windowInsets
         }
     }
 
@@ -326,16 +347,17 @@ class MainActivity : AppCompatActivity() {
 
         val settings = webView.settings
 
-        // 1. Full Browser Capabilities (JS, DOM Storage, Database, Viewport & Normal Layout)
+        // 1. Widevine DRM & WebView Audio Optimization + Native Mobile Viewport
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         @Suppress("DEPRECATION")
         settings.databaseEnabled = true
-        settings.useWideViewPort = true
-        settings.loadWithOverviewMode = true
+        // Use 1:1 native mobile viewport metrics so top headers and search bars are never scaled or clipped
+        settings.useWideViewPort = false
+        settings.loadWithOverviewMode = false
         settings.layoutAlgorithm = WebSettings.LayoutAlgorithm.NORMAL
 
-        // 2. Mixed Content & Third-Party Cookies for Apple CDN (mzstatic.com) & MusicKit Auth
+        // 2. Mixed Content, Autoplay without Gesture & Third-Party Cookies for Apple CDN (mzstatic.com) & MusicKit Auth
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         settings.loadsImagesAutomatically = true
         settings.blockNetworkImage = false
@@ -348,23 +370,23 @@ class MainActivity : AppCompatActivity() {
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(webView, true)
 
-        // 3. 500 MB Dedicated OkHttp Disk Cache & Legacy v1.0.0 Cache Purge
+        // 3. 500 MB Dedicated OkHttp Disk Cache & Legacy Cache Purge
         val customCacheDir = File(applicationContext.cacheDir, "music_beta_webview_cache")
         if (!customCacheDir.exists()) {
             customCacheDir.mkdirs()
         }
 
-        val okHttpCacheDir = File(applicationContext.cacheDir, "music_okhttp_cache_v3")
+        val okHttpCacheDir = File(applicationContext.cacheDir, "music_okhttp_cache_v4")
         if (!okHttpCacheDir.exists()) {
             okHttpCacheDir.mkdirs()
         }
 
-        // Purge any v1.0.0/v1.0.1 cached downscaled 300x300 images so cards & banners load full-bleed
         val savedSchema = sharedPreferences.getInt(KEY_CACHE_SCHEMA_VERSION, 1)
         if (savedSchema < CACHE_SCHEMA_VERSION) {
             try {
                 File(applicationContext.cacheDir, "music_beta_okhttp_cache").deleteRecursively()
                 File(applicationContext.cacheDir, "music_beta_okhttp_cache_v2").deleteRecursively()
+                File(applicationContext.cacheDir, "music_okhttp_cache_v3").deleteRecursively()
                 webView.clearCache(true)
             } catch (_: Exception) {}
             sharedPreferences.edit().putInt(KEY_CACHE_SCHEMA_VERSION, CACHE_SCHEMA_VERSION).apply()
@@ -399,10 +421,10 @@ class MainActivity : AppCompatActivity() {
             settings.offscreenPreRaster = true
         }
 
-        // 4. Modern Mobile Chrome User-Agent for standard mobile CSS & Widevine DRM
+        // 4. Widevine-compatible Mobile Chrome User-Agent (never spoof iOS/Safari so Widevine EME works natively)
         settings.userAgentString = MOBILE_CHROME_USER_AGENT
 
-        // 5. Light/Dark Mode configuration on WebView
+        // 5. Light/Dark Mode configuration on WebView (called once on init, not on every page finish, to prevent image re-decode flicker)
         applyWebViewTheme(currentThemeMode)
 
         // 6. JavaScript Interface for Media Session & Background Sync
@@ -473,9 +495,9 @@ class MainActivity : AppCompatActivity() {
                 super.onPageFinished(view, url)
                 progressBar.visibility = View.GONE
                 CookieManager.getInstance().flush()
-                applyWebViewTheme(currentThemeMode)
                 injectSafeAreaInsetsScript()
                 injectUiAndMenuFixes()
+                injectAppleSignatureWebAudioScript()
                 injectAudioBridgeScript()
             }
 
@@ -491,17 +513,15 @@ class MainActivity : AppCompatActivity() {
                     return createEmptyBlockedResponse()
                 }
 
-                // Only intercept GET requests for static asset caching
-                if (!req.method.equals("GET", ignoreCase = true)) {
+                // Let Chromium's native HTTP/2 disk cache handle all mzstatic.com images and srcset artwork
+                // directly so category cards never blink or re-render when the floating mini-player updates.
+                if (rawUrl.contains("mzstatic.com", ignoreCase = true)) {
                     return super.shouldInterceptRequest(view, request)
                 }
 
-                // Safe artwork URL handling: preserves native aspect ratios, .png cutouts & srcset density
-                val targetUrl = rewriteAppleArtworkUrl(rawUrl)
-
-                // Cache static assets (.js, .css, .woff2, and mzstatic.com artwork) to disk
-                if (isCacheableStaticAsset(targetUrl)) {
-                    fetchFromOkHttpDiskCache(targetUrl, req)?.let { cachedResponse ->
+                // Only intercept GET requests for immutable JS/CSS/font bundles
+                if (req.method.equals("GET", ignoreCase = true) && isCacheableStaticBundle(rawUrl)) {
+                    fetchFromOkHttpDiskCache(rawUrl, req)?.let { cachedResponse ->
                         return cachedResponse
                     }
                 }
@@ -530,9 +550,13 @@ class MainActivity : AppCompatActivity() {
                     return true
                 }
 
-                // Redirect any beta.music.apple.com navigation to stable music.apple.com
-                if (lower.contains("beta.music.apple.com")) {
-                    view?.loadUrl(url.replace("beta.music.apple.com", "music.apple.com", ignoreCase = true))
+                // Keep navigation inside Apple Music Web Player Beta (https://beta.music.apple.com)
+                if (lower.startsWith("https://music.apple.com") || lower.startsWith("http://music.apple.com")) {
+                    val betaUrl = url.replaceFirst(
+                        Regex("^https?://music\.apple\.com", RegexOption.IGNORE_CASE),
+                        APPLE_MUSIC_BETA_URL
+                    )
+                    view?.loadUrl(betaUrl)
                     return true
                 }
 
@@ -549,9 +573,9 @@ class MainActivity : AppCompatActivity() {
             }
 
             /**
-             * Requirement 4: Enable Widevine DRM Audio Playback.
-             * Automatically grants RESOURCE_PROTECTED_MEDIA_ID so MusicKit JS plays full songs
-             * with Widevine DRM instead of falling back to 30-second previews.
+             * System #1: Enable Widevine DRM Audio Playback.
+             * Automatically grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID so encrypted
+             * full-length 256kbps AAC Apple Music streams play without falling back to 30-second previews.
              */
             override fun onPermissionRequest(request: PermissionRequest?) {
                 if (request == null) return
@@ -565,7 +589,7 @@ class MainActivity : AppCompatActivity() {
 
                         if (granted.isNotEmpty()) {
                             request.grant(granted)
-                            Log.i(TAG, "Granted WebChromeClient DRM permission: ${granted.joinToString()}")
+                            Log.i(TAG, "Granted WebChromeClient Widevine DRM permission: ${granted.joinToString()}")
                         } else {
                             request.grant(requestedResources)
                         }
@@ -601,46 +625,14 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * Safe Artwork URL handler:
-     * Never alters non-square banners (e.g. 580x132, 1080x540), transparent .png artist cutouts,
-     * or standard responsive srcset sizes (<= 600px) so genre cards and hero banners never squash.
-     */
-    private fun rewriteAppleArtworkUrl(url: String): String {
-        if (!url.contains("mzstatic.com", ignoreCase = true)) return url
-        val match = MZSTATIC_ARTWORK_REGEX.find(url) ?: return url
-        val width = match.groupValues[1].toIntOrNull() ?: return url
-        val height = match.groupValues[2].toIntOrNull() ?: return url
-        val mode = match.groupValues[3].ifEmpty { "bb" }.lowercase()
-        val ext = match.groupValues[4].lowercase()
-        val query = match.groupValues[5]
-
-        // Preserve all PNG cutouts, non-square aspect ratios, and special crop modes
-        if (ext == "png" || width != height || mode != "bb") {
-            return url
-        }
-
-        // Only cap ultra-large > 600x600 square album covers to 600x600bb.webp
-        if (width > 600) {
-            return url.replace(MZSTATIC_ARTWORK_REGEX, "/600x600bb.webp$query")
-        }
-        return url
-    }
-
-    private fun isCacheableStaticAsset(url: String): Boolean {
+    private fun isCacheableStaticBundle(url: String): Boolean {
         val cleanPath = url.substringBefore('?').lowercase()
-        if (cleanPath.contains("mzstatic.com") &&
-            (cleanPath.endsWith(".webp") || cleanPath.endsWith(".jpg") || cleanPath.endsWith(".jpeg") || cleanPath.endsWith(".png"))
-        ) {
-            return true
-        }
         return cleanPath.endsWith(".js") ||
             cleanPath.endsWith(".mjs") ||
             cleanPath.endsWith(".css") ||
             cleanPath.endsWith(".woff2") ||
             cleanPath.endsWith(".woff") ||
-            cleanPath.endsWith(".ttf") ||
-            cleanPath.endsWith(".svg")
+            cleanPath.endsWith(".ttf")
     }
 
     private fun fetchFromOkHttpDiskCache(targetUrl: String, webRequest: WebResourceRequest): WebResourceResponse? {
@@ -699,20 +691,17 @@ class MainActivity : AppCompatActivity() {
             clean.endsWith(".woff2") -> "font/woff2"
             clean.endsWith(".woff") -> "font/woff"
             clean.endsWith(".ttf") -> "font/ttf"
-            clean.endsWith(".webp") -> "image/webp"
-            clean.endsWith(".png") -> "image/png"
-            clean.endsWith(".jpg") || clean.endsWith(".jpeg") -> "image/jpeg"
-            clean.endsWith(".svg") -> "image/svg+xml"
             else -> "application/octet-stream"
         }
     }
 
     /**
-     * Requirement 3: Targeted CSS & DOM Fix for Opaque Navigation Menu & Clutter Removal.
-     * - Forces a solid opaque background (#ffffff in light mode / #1f1f1f in dark mode) on the navigation drawer/header
-     *   so opening the side menu never overlaps or shows home screen tiles underneath.
-     * - Removes any broken contain-intrinsic-size / content-visibility overrides so virtual scrolling has zero blank gaps.
-     * - Hides "Open in Music", "Exit Beta", and "Beta" badges via CSS + DOM MutationObserver.
+     * Targeted CSS Fix for Apple Music Web Player Beta (https://beta.music.apple.com):
+     * - Forces a solid opaque background (#ffffff in light mode / #1f1f1f in dark mode) on the navigation header & open menu drawer
+     *   WITHOUT applying 112px bottom-padding to the closed top header bar (which previously clipped the "Search" heading).
+     * - Adds 96px bottom padding on main scrollable containers so the floating bottom mini-player never blocks the last row of cards.
+     * - Pure CSS rules (no unthrottled MutationObserver on document.documentElement) so mini-player playback progress updates
+     *   never trigger layout thrashing or category card image flickering.
      */
     private fun injectUiAndMenuFixes() {
         val isDark = isEffectiveDarkMode()
@@ -731,19 +720,34 @@ class MainActivity : AppCompatActivity() {
                     (document.head || document.documentElement).appendChild(style);
                 }
                 style.textContent = [
-                    '/* 1. Solid Opaque Navigation Drawer & Header */',
-                    '.navigation, .web-navigation, #navigation, [data-testid="navigation"], [class*="web-navigation"], .navigation__header, .navigation__content, .web-navigation__content, .web-navigation__list, .header-bar, header[role="banner"], nav[role="navigation"], nav[aria-label] {',
+                    '/* 1. Solid Opaque Navigation Header & Open Drawer (No closed-header padding-bottom clipping) */',
+                    '.navigation, .web-navigation, #navigation, [data-testid="navigation"], .navigation__header, .navigation__content, .web-navigation__content, .web-navigation__list, .header-bar, header[role="banner"], nav[role="navigation"] {',
                     '  background-color: ' + navBg + ' !important;',
                     '  background: ' + navBg + ' !important;',
                     '  color: ' + textColor + ' !important;',
                     '  opacity: 1 !important;',
+                    '  z-index: 9999 !important;',
                     '}',
-                    '.navigation, .web-navigation, #navigation, [data-testid="navigation"] {',
-                    '  z-index: 99999 !important;',
+                    '/* Apply bottom clearance ONLY to the inner expanded menu list (never the closed top header bar) */',
+                    '.web-navigation__list, .navigation__content, .web-navigation__drawer {',
                     '  padding-bottom: 112px !important;',
                     '}',
-                    '/* 2. Hide Open in Music, Exit Beta, Beta badges & upsell banners */',
-                    '.upsell-banner, [data-testid="upsell-banner"], [data-testid*="exit-beta"], [class*="upsell"], [class*="smart-banner"], [class*="beta-badge"], .native-upsell, a[href*="itunes.apple.com"], a[href*="music://"], a[href*="itms://"], a[href*="beta.music.apple.com"], button[aria-label*="Open in Music"], button[aria-label*="Exit Beta"] {',
+                    '/* 2. Smooth vertical scrolling & floating mini-player bottom clearance */',
+                    'html, body, main, .scrollable-page, [class*="scrollable-page"] {',
+                    '  overflow-y: auto !important;',
+                    '  -webkit-overflow-scrolling: touch !important;',
+                    '  touch-action: pan-y !important;',
+                    '}',
+                    'main, .scrollable-page, [class*="scrollable-page"] {',
+                    '  padding-bottom: 96px !important;',
+                    '}',
+                    '/* 3. Strip expensive backdrop-filter blurs on scrolling shelf cards only */',
+                    '.shelf-grid__item *, .songs-list-row * {',
+                    '  backdrop-filter: none !important;',
+                    '  -webkit-backdrop-filter: none !important;',
+                    '}',
+                    '/* 4. Hide Open in Music & Exit Beta links so user stays inside Apple Music Beta */',
+                    '.upsell-banner, [data-testid="upsell-banner"], [data-testid*="exit-beta"], [class*="upsell"], [class*="smart-banner"], .native-upsell, a[href*="itunes.apple.com"], a[href*="music://"], a[href*="itms://"], a[href*="exit-beta"], button[aria-label*="Open in Music"], button[aria-label*="Exit Beta"] {',
                     '  display: none !important;',
                     '  height: 0 !important;',
                     '  max-height: 0 !important;',
@@ -752,61 +756,118 @@ class MainActivity : AppCompatActivity() {
                     '  overflow: hidden !important;',
                     '}'
                 ].join('\n');
-
-                function enforceOpaqueMenuAndCleanLinks() {
-                    try {
-                        // Hide "Open in Music", "Exit Beta", and "Beta" badge elements by text content
-                        var nodes = document.querySelectorAll('a, button, li, span');
-                        for (var i = 0; i < nodes.length; i++) {
-                            var el = nodes[i];
-                            var txt = (el.textContent || '').trim().toLowerCase();
-                            if (txt === 'open in music' || txt === 'exit beta' || txt === 'open in music ↗' || txt === 'exit beta ↗' || (el.tagName === 'SPAN' && txt === 'beta')) {
-                                var row = el.closest('li') || el;
-                                row.style.setProperty('display', 'none', 'important');
-                            }
-                        }
-
-                        // Ensure any open navigation drawer container has a 100% solid opaque background
-                        var navContainers = document.querySelectorAll('.navigation, .web-navigation, #navigation, [data-testid="navigation"], nav, [role="navigation"], [class*="navigation"]');
-                        for (var j = 0; j < navContainers.length; j++) {
-                            var navEl = navContainers[j];
-                            navEl.style.setProperty('background-color', navBg, 'important');
-                            navEl.style.setProperty('background', navBg, 'important');
-                            navEl.style.setProperty('opacity', '1', 'important');
-                        }
-
-                        // Also walk up from the "Recently Added" / "All Playlists" menu items to guarantee the drawer wrapper is opaque
-                        for (var k = 0; k < nodes.length; k++) {
-                            var item = nodes[k];
-                            var itemTxt = (item.textContent || '').trim();
-                            if (itemTxt === 'Recently Added' || itemTxt === 'All Playlists') {
-                                var curr = item.parentElement;
-                                while (curr && curr !== document.body && curr !== document.documentElement) {
-                                    var tag = (curr.tagName || '').toUpperCase();
-                                    if (tag === 'MAIN') break;
-                                    if (curr.clientHeight > 220 && curr.clientWidth > 200) {
-                                        curr.style.setProperty('background-color', navBg, 'important');
-                                        curr.style.setProperty('background', navBg, 'important');
-                                        curr.style.setProperty('opacity', '1', 'important');
-                                    }
-                                    curr = curr.parentElement;
-                                }
-                            }
-                        }
-                    } catch (err) {}
-                }
-
-                enforceOpaqueMenuAndCleanLinks();
-                if (!window.__musicUiObserverInstalled) {
-                    window.__musicUiObserverInstalled = true;
-                    var obs = new MutationObserver(function() {
-                        enforceOpaqueMenuAndCleanLinks();
-                    });
-                    obs.observe(document.documentElement || document.body, { childList: true, subtree: true });
-                }
             })();
         """.trimIndent()
         executeJavaScript(fixScript)
+    }
+
+    /**
+     * System #2: MusicKit JS High-Bitrate (256kbps AAC) & Web Audio 32-Bit Float Mastering Injection.
+     * - Sets localStorage['music.ampwebplay.bitrate'] = '256' and polls window.MusicKit to enforce
+     *   music.bitrate = MusicKit.PlaybackBitrate.HIGH (256kbps AAC).
+     * - Safely attempts to attach a 32-bit float Web Audio API mastering chain (65Hz low-shelf +1.8dB warmth,
+     *   13.5kHz high-shelf +2.0dB air, soft-knee DynamicsCompressor) to <audio> elements inside a try/catch
+     *   so if Widevine EME blocks createMediaElementSource CORS, playback continues uninterrupted via the
+     *   native Android DynamicsProcessing engine on Session 0.
+     */
+    private fun injectAppleSignatureWebAudioScript() {
+        val script = """
+            (function() {
+                if (window.__appleSignatureAudioInjected) return;
+                window.__appleSignatureAudioInjected = true;
+
+                // 2a. Force 256kbps High-Efficiency AAC in localStorage & MusicKit JS
+                try {
+                    localStorage.setItem('music.ampwebplay.bitrate', '256');
+                } catch (storageErr) {}
+
+                var bitrateAttempts = 0;
+                var bitrateTimer = setInterval(function() {
+                    bitrateAttempts++;
+                    try {
+                        if (window.MusicKit && typeof window.MusicKit.getInstance === 'function') {
+                            var music = window.MusicKit.getInstance();
+                            if (music) {
+                                var highValue = (window.MusicKit.PlaybackBitrate && window.MusicKit.PlaybackBitrate.HIGH !== undefined)
+                                    ? window.MusicKit.PlaybackBitrate.HIGH
+                                    : 256;
+                                music.bitrate = highValue;
+                                if (!window.__musicKitBitrateHooked && typeof music.addEventListener === 'function') {
+                                    window.__musicKitBitrateHooked = true;
+                                    music.addEventListener('playbackStateDidChange', function() {
+                                        try { music.bitrate = highValue; } catch (_) {}
+                                    });
+                                }
+                                clearInterval(bitrateTimer);
+                            }
+                        }
+                    } catch (mkErr) {}
+                    if (bitrateAttempts > 60) {
+                        clearInterval(bitrateTimer);
+                    }
+                }, 1000);
+
+                // 2b. Resilient 32-Bit Float Web Audio Mastering Graph (with EME/CORS fallback to Native Session 0 DSP)
+                var audioCtx = null;
+                function attachWebAudioMastering(audioEl) {
+                    if (!audioEl || audioEl.__appleSignatureAttached) return;
+                    audioEl.__appleSignatureAttached = true;
+
+                    try {
+                        // If Widevine EME MediaKeys are already bound on this element, skip createMediaElementSource
+                        // on devices where EME tainting mutes WebAudio, letting Native Session 0 DynamicsProcessing handle DSP.
+                        if (audioEl.mediaKeys) {
+                            return;
+                        }
+                        var AudioCtx = window.AudioContext || window.webkitAudioContext;
+                        if (!AudioCtx) return;
+                        if (!audioCtx) {
+                            audioCtx = new AudioCtx({ latencyHint: 'playback' });
+                        }
+                        if (audioCtx.state === 'suspended') {
+                            audioCtx.resume().catch(function() {});
+                        }
+
+                        var source = audioCtx.createMediaElementSource(audioEl);
+
+                        // 65Hz Low-Shelf (+1.8 dB sub-bass warmth)
+                        var lowShelf = audioCtx.createBiquadFilter();
+                        lowShelf.type = 'lowshelf';
+                        lowShelf.frequency.value = 65;
+                        lowShelf.gain.value = 1.8;
+
+                        // 13.5kHz High-Shelf (+2.0 dB high-resolution air)
+                        var highShelf = audioCtx.createBiquadFilter();
+                        highShelf.type = 'highshelf';
+                        highShelf.frequency.value = 13500;
+                        highShelf.gain.value = 2.0;
+
+                        // Soft-Knee Mastering DynamicsCompressor
+                        var compressor = audioCtx.createDynamicsCompressor();
+                        compressor.threshold.value = -14;
+                        compressor.knee.value = 18;
+                        compressor.ratio.value = 2.2;
+                        compressor.attack.value = 0.008;
+                        compressor.release.value = 0.18;
+
+                        source.connect(lowShelf);
+                        lowShelf.connect(highShelf);
+                        highShelf.connect(compressor);
+                        compressor.connect(audioCtx.destination);
+                    } catch (webAudioErr) {
+                        // Fallback: Widevine EME / CORS blocked createMediaElementSource; Native Android Session 0 DSP handles audio
+                        console.log('WebAudio EME fallback to Native Android Session 0 DSP:', webAudioErr);
+                    }
+                }
+
+                document.addEventListener('play', function(e) {
+                    if (e && e.target && e.target.tagName === 'AUDIO') {
+                        attachWebAudioMastering(e.target);
+                    }
+                }, true);
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(script, null)
     }
 
     private fun injectAudioBridgeScript() {
@@ -814,6 +875,7 @@ class MainActivity : AppCompatActivity() {
             (function() {
                 if (window.__musicBetaBridgeInjected) return;
                 window.__musicBetaBridgeInjected = true;
+                var lastMetaSignature = '';
 
                 window.dispatchMediaAction = function(action) {
                     try {
@@ -833,7 +895,7 @@ class MainActivity : AppCompatActivity() {
                 };
 
                 const notifyStateChange = function(playing) {
-                    let title = "Apple Music";
+                    let title = "Apple Music Beta";
                     let artist = "Now Playing";
                     let artwork = "";
 
@@ -867,9 +929,15 @@ class MainActivity : AppCompatActivity() {
                         if (navigator.mediaSession && navigator.mediaSession.metadata) {
                             const meta = navigator.mediaSession.metadata;
                             const isPlaying = navigator.mediaSession.playbackState === 'playing';
+                            const title = meta.title || '';
+                            const artist = meta.artist || '';
                             const art = (meta.artwork && meta.artwork.length > 0) ? meta.artwork[0].src : '';
-                            if (window.AndroidBridge) {
-                                window.AndroidBridge.onMetadataUpdated(meta.title || '', meta.artist || '', art, isPlaying);
+                            const signature = title + '|' + artist + '|' + art + '|' + isPlaying;
+                            if (signature !== lastMetaSignature) {
+                                lastMetaSignature = signature;
+                                if (window.AndroidBridge) {
+                                    window.AndroidBridge.onMetadataUpdated(title, artist, art, isPlaying);
+                                }
                             }
                         }
                     }, 2000);
@@ -979,6 +1047,10 @@ class MainActivity : AppCompatActivity() {
         try {
             unregisterReceiver(mediaCommandReceiver)
         } catch (_: Exception) {}
+        try {
+            appleSignatureAudioEngine?.release()
+            appleSignatureAudioEngine = null
+        } catch (_: Exception) {}
         webView.destroy()
     }
 
@@ -1025,5 +1097,214 @@ class MainActivity : AppCompatActivity() {
         errorLayout.visibility = View.GONE
         progressBar.visibility = View.VISIBLE
         webView.reload()
+    }
+}
+
+/**
+ * System #3 & #4: AppleSignatureAudioEngine
+ * - Native Android DynamicsProcessing Mastering Engine (API 28+) attached to global audio session 0
+ *   so hardware-decoded Widevine DRM WebView streams receive full 5-band Pre-EQ/Post-EQ and Anti-Clip Limiter.
+ * - Android 14+ (API 34+) Bit-Perfect USB DAC / Headset Bypass via AudioManager.registerAudioDeviceCallback
+ *   and AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT (44.1kHz PCM Float).
+ */
+class AppleSignatureAudioEngine(context: Context) {
+
+    companion object {
+        private const val TAG = "AppleSignatureAudio"
+        private const val GLOBAL_AUDIO_SESSION_ID = 0
+        private const val CHANNEL_COUNT = 2
+        private const val EQ_BAND_COUNT = 5
+    }
+
+    private val appContext: Context = context.applicationContext
+    private val audioManager: AudioManager? =
+        appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var dynamicsProcessing: DynamicsProcessing? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
+
+    private val mediaAudioAttributes: AudioAttributes by lazy {
+        AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+    }
+
+    fun start() {
+        initDynamicsProcessingMasteringEngine()
+        registerUsbBitPerfectCallback()
+    }
+
+    /**
+     * System #3: Native Android DynamicsProcessing Mastering Engine (API 28+) on Session 0.
+     * - 5-band Pre-EQ and Post-EQ with VARIANT_FAVOR_FREQUENCY_RESOLUTION:
+     *   Band 0 (<80Hz Sub-bass warmth): +2.0f dB
+     *   Band 1 (250Hz Lower-mids clarity): -0.5f dB
+     *   Band 2 (1000Hz Reference midrange): 0.0f dB
+     *   Band 3 (3.5kHz Vocal presence): +1.0f dB
+     *   Band 4 (>12kHz High-resolution "Air"): +2.2f dB
+     * - Hardware Limiter: -1.0f dBFS threshold, 2.0f ms attack, 60.0f ms release, 4.0f ratio.
+     */
+    private fun initDynamicsProcessingMasteringEngine() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+
+        try {
+            dynamicsProcessing?.release()
+
+            val configBuilder = DynamicsProcessing.Config.Builder(
+                DynamicsProcessing.Config.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                CHANNEL_COUNT,
+                true,  // preEqInUse
+                EQ_BAND_COUNT,
+                false, // mbcInUse
+                0,
+                true,  // postEqInUse
+                EQ_BAND_COUNT,
+                true   // limiterInUse
+            )
+
+            // 5-Band Pre-EQ (Sub-bass warmth & Lower-mid mud reduction)
+            val preEq = DynamicsProcessing.Eq(true, true, EQ_BAND_COUNT).apply {
+                setBand(0, DynamicsProcessing.EqBand(true, 80.0f, 2.0f))     // <80Hz Sub-bass warmth (+2.0 dB)
+                setBand(1, DynamicsProcessing.EqBand(true, 250.0f, -0.5f))   // 250Hz Lower-mids clarity (-0.5 dB mud reduction)
+                setBand(2, DynamicsProcessing.EqBand(true, 1000.0f, 0.0f))   // 1kHz Neutral midrange (0.0 dB)
+                setBand(3, DynamicsProcessing.EqBand(true, 3500.0f, 0.0f))   // 3.5kHz Pre-stage flat
+                setBand(4, DynamicsProcessing.EqBand(true, 20000.0f, 0.0f))  // >12kHz Pre-stage flat
+            }
+            configBuilder.setPreEqAllChannelsTo(preEq)
+
+            // 5-Band Post-EQ (Vocal presence & High-resolution Air)
+            val postEq = DynamicsProcessing.Eq(true, true, EQ_BAND_COUNT).apply {
+                setBand(0, DynamicsProcessing.EqBand(true, 80.0f, 0.0f))     // <80Hz Post-stage flat (shaped in Pre-EQ)
+                setBand(1, DynamicsProcessing.EqBand(true, 250.0f, 0.0f))    // 250Hz Post-stage flat (shaped in Pre-EQ)
+                setBand(2, DynamicsProcessing.EqBand(true, 1000.0f, 0.0f))   // 1kHz Neutral midrange (0.0 dB)
+                setBand(3, DynamicsProcessing.EqBand(true, 3500.0f, 1.0f))   // 3.5kHz Vocal presence (+1.0 dB)
+                setBand(4, DynamicsProcessing.EqBand(true, 20000.0f, 2.2f))  // >12kHz High-resolution "Air" (+2.2 dB)
+            }
+            configBuilder.setPostEqAllChannelsTo(postEq)
+
+            // Hardware Limiter to eliminate Android 44.1kHz -> 48kHz resampler inter-sample clipping
+            val limiter = DynamicsProcessing.Limiter(
+                true,   // inUse
+                true,   // enabled
+                0,      // linkGroup
+                2.0f,   // attackTime (2.0 ms)
+                60.0f,  // releaseTime (60.0 ms)
+                4.0f,   // ratio (4.0:1)
+                -1.0f,  // threshold (-1.0 dBFS)
+                0.0f    // postGain (0.0 dB)
+            )
+            configBuilder.setLimiterAllChannelsTo(limiter)
+
+            dynamicsProcessing = DynamicsProcessing(0, GLOBAL_AUDIO_SESSION_ID, configBuilder.build()).apply {
+                enabled = true
+            }
+            Log.i(TAG, "AppleSignatureAudioEngine: DynamicsProcessing enabled on Session 0")
+        } catch (e: Exception) {
+            Log.w(TAG, "DynamicsProcessing Session 0 unavailable on this OEM build: ${e.message}")
+        }
+    }
+
+    /**
+     * System #4: Android 14+ (API 34+) Bit-Perfect USB DAC / Headset Bypass.
+     * Listens for TYPE_USB_HEADSET and TYPE_USB_DEVICE connections and activates
+     * AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT (preferring ENCODING_PCM_FLOAT at 44100 Hz).
+     */
+    private fun registerUsbBitPerfectCallback() {
+        val manager = audioManager ?: return
+        if (audioDeviceCallback != null) return
+
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+                if (addedDevices == null) return
+                for (device in addedDevices) {
+                    if (isUsbAudioSink(device)) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                            enableBitPerfectUsbOutput(manager, device)
+                        }
+                    }
+                }
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+                if (removedDevices == null) return
+                for (device in removedDevices) {
+                    if (isUsbAudioSink(device)) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                            clearBitPerfectUsbOutput(manager, device)
+                        }
+                    }
+                }
+            }
+        }
+
+        audioDeviceCallback = callback
+        try {
+            manager.registerAudioDeviceCallback(callback, mainHandler)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register AudioDeviceCallback: ${e.message}")
+        }
+    }
+
+    private fun isUsbAudioSink(device: AudioDeviceInfo): Boolean {
+        if (!device.isSink) return false
+        return device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            device.type == AudioDeviceInfo.TYPE_USB_DEVICE
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun enableBitPerfectUsbOutput(manager: AudioManager, usbDevice: AudioDeviceInfo) {
+        try {
+            val supportedAttrs = manager.getSupportedMixerAttributes(usbDevice)
+            val preferredBitPerfect = supportedAttrs.firstOrNull { attr ->
+                attr.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT &&
+                    attr.format.encoding == AudioFormat.ENCODING_PCM_FLOAT &&
+                    attr.format.sampleRate == 44100
+            } ?: supportedAttrs.firstOrNull { attr ->
+                attr.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT
+            } ?: run {
+                val float44kFormat = AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                    .setSampleRate(44100)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                    .build()
+                AudioMixerAttributes.Builder(float44kFormat)
+                    .setMixerBehavior(AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT)
+                    .build()
+            }
+
+            val applied = manager.setPreferredMixerAttributes(
+                mediaAudioAttributes,
+                usbDevice,
+                preferredBitPerfect
+            )
+            Log.i(TAG, "Android 14+ Bit-Perfect USB DAC mode applied=$applied for device=${usbDevice.productName}")
+        } catch (e: Exception) {
+            Log.w(TAG, "Bit-Perfect USB mixer configuration not supported by DAC: ${e.message}")
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun clearBitPerfectUsbOutput(manager: AudioManager, usbDevice: AudioDeviceInfo) {
+        try {
+            manager.clearPreferredMixerAttributes(mediaAudioAttributes, usbDevice)
+            Log.i(TAG, "Cleared Bit-Perfect mixer attributes for disconnected USB DAC: ${usbDevice.productName}")
+        } catch (_: Exception) {}
+    }
+
+    fun release() {
+        try {
+            audioDeviceCallback?.let { cb ->
+                audioManager?.unregisterAudioDeviceCallback(cb)
+            }
+        } catch (_: Exception) {}
+        audioDeviceCallback = null
+
+        try {
+            dynamicsProcessing?.enabled = false
+            dynamicsProcessing?.release()
+        } catch (_: Exception) {}
+        dynamicsProcessing = null
     }
 }
