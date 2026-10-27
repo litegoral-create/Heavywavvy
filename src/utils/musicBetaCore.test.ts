@@ -232,12 +232,29 @@ test('getAppleSignatureAudioConfig and generateAppleSignatureWebAudioScript conf
   const { PROJECT_FILES } = await import('../data/projectFiles');
   const mainActivity = PROJECT_FILES.find((f) => f.path.endsWith('MainActivity.kt'));
   assert.ok(mainActivity);
+  assert.ok(mainActivity.content.includes('MutableContextWrapper(context.applicationContext)'));
+  assert.ok(mainActivity.content.includes('if (webView.parent != null)'));
+  assert.ok(mainActivity.content.includes('(webView.parent as? ViewGroup)?.removeView(webView)'));
+  assert.ok(mainActivity.content.includes('if (webView.url == null)'));
+  assert.ok(mainActivity.content.includes('https://amp-api.music.apple.com'));
+  assert.ok(mainActivity.content.includes('https://aod-ssl.itunes.apple.com'));
+  assert.ok(mainActivity.content.includes('https://is1-ssl.mzstatic.com'));
+  assert.ok(mainActivity.content.includes('CookieManager.getInstance().flush()'));
+  assert.ok(mainActivity.content.includes('override fun onRenderProcessGone'));
+  assert.ok(mainActivity.content.includes('WebSettings.LOAD_DEFAULT'));
+  assert.ok(mainActivity.content.includes('setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)'));
+  assert.ok(mainActivity.content.includes('isAudioEngineInitialized'));
+  assert.ok(!mainActivity.content.includes('okhttp3'));
   assert.ok(mainActivity.content.includes('DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION'));
   assert.ok(!mainActivity.content.includes('DynamicsProcessing.Config.VARIANT_FAVOR_FREQUENCY_RESOLUTION'));
   assert.ok(mainActivity.content.includes('setEnabled(true)'));
   assert.ok(mainActivity.content.includes('dynamicsProcessing?.setEnabled(false)'));
   assert.ok(!mainActivity.content.includes('music\\.apple'));
   assert.ok(mainActivity.content.includes('music\\\\.apple\\\\.com'));
+
+  const buildGradle = PROJECT_FILES.find((f) => f.path === 'app/build.gradle.kts');
+  assert.ok(buildGradle);
+  assert.ok(!buildGradle.content.includes('okhttp3'));
 
   const fs = await import('node:fs');
   for (const file of PROJECT_FILES) {

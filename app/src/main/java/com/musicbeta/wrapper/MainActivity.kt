@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.MutableContextWrapper
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -18,8 +19,6 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioMixerAttributes
 import android.media.audiofx.DynamicsProcessing
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -27,10 +26,12 @@ import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -51,32 +52,31 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
-import okhttp3.Cache
-import okhttp3.CacheControl
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.ByteArrayInputStream
 import java.io.File
-import java.util.concurrent.TimeUnit
 
 /**
  * MainActivity for MusicBetaWrapper (v1.1.0).
- * High-performance, edge-to-edge native Android 14 wrapper around https://beta.music.apple.com (Apple Music Web Player Beta)
+ * High-performance, zero-reload, edge-to-edge native Android 14 wrapper around https://beta.music.apple.com
  *
- * Integrated Audio & Visual Systems:
- * 1. Widevine DRM & WebView Audio Optimization:
+ * Integrated Audio, Persistence & Crash-Safety Systems:
+ * 1. Crash-Safe WebView Singleton Re-Attachment:
+ *    - Retains a single WebView instance across UI recompositions/navigation using MutableContextWrapper(context.applicationContext).
+ *    - Always executes if (webView.parent != null) { (webView.parent as? ViewGroup)?.removeView(webView) } before attaching.
+ *    - Only calls webView.loadUrl(...) if webView.url == null so an already loaded session never reloads.
+ * 2. Widevine DRM & WebView Audio Optimization:
  *    - Grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID in WebChromeClient with a Widevine-compatible Mobile Chrome User-Agent.
- * 2. MusicKit JS High-Bitrate (256kbps AAC) & Web Audio 32-Bit Float Mastering Injection:
- *    - Polls window.MusicKit, sets music.bitrate = MusicKit.PlaybackBitrate.HIGH (256kbps AAC) & localStorage['music.ampwebplay.bitrate'] = '256',
+ * 3. MusicKit JS High-Bitrate (256kbps AAC), Preconnect Injection & Web Audio 32-Bit Float Mastering:
+ *    - Injects <link rel="preconnect"> tags for amp-api.music.apple.com, aod-ssl.itunes.apple.com, and is1-ssl.mzstatic.com + CookieManager.flush().
+ *    - Polls window.MusicKit, forces music.bitrate = MusicKit.PlaybackBitrate.HIGH (256kbps AAC) & localStorage['music.ampwebplay.bitrate'] = '256',
  *      and safely hooks <audio> elements into a 32-bit float AudioContext (65Hz +1.8dB warmth, 13.5kHz +2.0dB air, soft-knee compressor)
  *      with automatic fallback to Native Android DSP if Widevine EME blocks createMediaElementSource CORS.
- * 3. Native Android DynamicsProcessing Mastering Engine (API 28+, Session 0):
- *    - Dedicated AppleSignatureAudioEngine attached to global output session 0 with 5-band Pre-EQ/Post-EQ
- *      (<80Hz +2.0dB, 250Hz -0.5dB, 1kHz 0.0dB, 3.5kHz +1.0dB, >12kHz +2.2dB) and hardware Limiter (-1.0dBFS, 2ms attack, 60ms release, 4:1 ratio).
- * 4. Android 14+ (API 34+) Bit-Perfect USB DAC / Headset Bypass:
- *    - Automatic AudioDeviceCallback listener routing TYPE_USB_HEADSET and TYPE_USB_DEVICE via AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT.
- * 5. Zero Image Flickering & Unclipped Search Header:
- *    - Native Chromium HTTP/2 disk cache for mzstatic.com srcset artwork + opaque #ffffff/#1f1f1f nav drawer + 96px floating mini-player scroll clearance.
+ *    - Implements WebViewClient.onRenderProcessGone returning true to recover gracefully without crashing on low memory.
+ * 4. Built-In Chromium Cache & Background Renderer Priority:
+ *    - Uses WebSettings.LOAD_DEFAULT + domStorageEnabled = true (zero external OkHttp interceptors) and sets
+ *      WebView.RENDERER_PRIORITY_IMPORTANT on API 26+ inside try/catch.
+ * 5. Native Android DynamicsProcessing Mastering Engine (API 28+, Session 0) & Android 14+ Bit-Perfect USB DAC Bypass:
+ *    - Guarded by isAudioEngineInitialized and full try/catch (Throwable) blocks so re-attaching UI never creates duplicate effects on Session 0.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -86,11 +86,9 @@ class MainActivity : AppCompatActivity() {
         private const val NOTIFICATION_PERMISSION_CODE = 1001
         private const val DISK_CACHE_MAX_BYTES = 500L * 1024L * 1024L // 500 MB
 
-        // Preferences for Light/Dark Mode & Cache Schema Migration
+        // Preferences for Light/Dark Mode
         private const val PREFS_NAME = "music_wrapper_prefs"
         private const val KEY_THEME_MODE = "pref_theme_mode"
-        private const val KEY_CACHE_SCHEMA_VERSION = "pref_cache_schema_version"
-        private const val CACHE_SCHEMA_VERSION = 4
         const val THEME_SYSTEM = "system"
         const val THEME_LIGHT = "light"
         const val THEME_DARK = "dark"
@@ -118,15 +116,62 @@ class MainActivity : AppCompatActivity() {
             "browser.sentry-cdn.com",
             "/sentry/"
         )
+
+        // System #1: Crash-Safe Singleton WebView with MutableContextWrapper
+        @Volatile
+        private var singletonContextWrapper: MutableContextWrapper? = null
+
+        @SuppressLint("StaticFieldLeak")
+        @Volatile
+        private var singletonWebView: WebView? = null
+
+        @Volatile
+        private var isWebViewConfigured: Boolean = false
+
+        // System #4: Guard Against Duplicate Audio DSP Initialization
+        @Volatile
+        var isAudioEngineInitialized: Boolean = false
+            private set
+
+        @Volatile
+        private var singletonAudioEngine: AppleSignatureAudioEngine? = null
+
+        /**
+         * Crash-safe singleton WebView factory/accessor using MutableContextWrapper(context.applicationContext).
+         * Always detaches the WebView from any existing parent ViewGroup BEFORE returning so attaching to a
+         * FrameLayout or Compose AndroidView factory NEVER throws IllegalStateException: The specified child already has a parent.
+         */
+        @Synchronized
+        fun obtainDetachedSingletonWebView(context: Context): WebView {
+            val wrapper = singletonContextWrapper ?: MutableContextWrapper(context.applicationContext).also {
+                singletonContextWrapper = it
+            }
+            wrapper.baseContext = context
+
+            val webView = singletonWebView ?: WebView(wrapper).also { created ->
+                created.id = R.id.webView
+                created.layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                singletonWebView = created
+            }
+
+            // CRITICAL CRASH GUARD: Always remove from previous parent before returning or re-attaching
+            if (webView.parent != null) {
+                (webView.parent as? ViewGroup)?.removeView(webView)
+            }
+
+            return webView
+        }
     }
 
-    private lateinit var rootContainer: View
+    private lateinit var rootContainer: FrameLayout
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
     private lateinit var errorLayout: FrameLayout
     private lateinit var insetsController: WindowInsetsControllerCompat
     private lateinit var sharedPreferences: SharedPreferences
-    private lateinit var okHttpClient: OkHttpClient
     private var appleSignatureAudioEngine: AppleSignatureAudioEngine? = null
 
     private var currentRefreshRate: Float = 60.0f
@@ -169,9 +214,11 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         rootContainer = findViewById(R.id.rootContainer)
-        webView = findViewById(R.id.webView)
         progressBar = findViewById(R.id.progressBar)
         errorLayout = findViewById(R.id.errorLayout)
+
+        // 3. Attach Crash-Safe Singleton WebView (Prevent IllegalStateException)
+        attachOrRecoverWebView()
 
         // Setup Safe Area Inset Handling to resolve Status Bar & Camera Notch Overlap
         setupWindowInsetsHandling()
@@ -179,13 +226,9 @@ class MainActivity : AppCompatActivity() {
         // Request POST_NOTIFICATIONS on Android 13+ (API 33+) for foreground media notification
         checkNotificationPermission()
 
-        // 3. Initialize Native "Apple Signature Sound" DynamicsProcessing DSP (Session 0) & Android 14+ Bit-Perfect USB DAC Engine
-        appleSignatureAudioEngine = AppleSignatureAudioEngine(applicationContext).also { engine ->
-            engine.start()
-        }
-
-        // 4. Configure WebView with Full Browser Capabilities, 3rd-Party Cookies, Widevine DRM & 500MB Cache
-        configureHighPerformanceWebView()
+        // 4. Initialize Native "Apple Signature Sound" DynamicsProcessing DSP (Session 0) & Android 14+ Bit-Perfect USB DAC Engine
+        // Guarded by isAudioEngineInitialized and full try/catch (Throwable) blocks so UI re-attachment never duplicates effects
+        initSingletonAudioEngineSafely()
 
         // 5. Setup Back-press handling to navigate WebView history without reload
         setupBackNavigation()
@@ -198,20 +241,80 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(mediaCommandReceiver, filter)
         }
 
-        // 7. Load Apple Music Web Player Beta (https://beta.music.apple.com)
-        if (savedInstanceState == null) {
-            val incomingUrl = intent?.dataString
-            val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
-                incomingUrl.replace(
-                    Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
-                    APPLE_MUSIC_BETA_URL
-                )
-            } else {
+        // 7. Zero-Reload Persistence: Only call webView.loadUrl(...) if webView.url == null
+        val incomingUrl = intent?.dataString
+        val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
+            incomingUrl.replace(
+                Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
                 APPLE_MUSIC_BETA_URL
-            }
+            )
+        } else {
+            APPLE_MUSIC_BETA_URL
+        }
+
+        if (webView.url == null) {
             webView.loadUrl(targetUrl)
         } else {
-            webView.restoreState(savedInstanceState)
+            progressBar.visibility = View.GONE
+            injectSafeAreaInsetsScript()
+            injectUiAndMenuFixes()
+        }
+    }
+
+    /**
+     * Attaches the singleton WebView to rootContainer safely, removing any XML placeholder WebView
+     * and ensuring webView.parent is cleared before addView so IllegalStateException can never occur.
+     */
+    private fun attachOrRecoverWebView() {
+        val xmlPlaceholder = rootContainer.findViewById<View>(R.id.webView)
+        if (xmlPlaceholder != null && xmlPlaceholder !== singletonWebView) {
+            (xmlPlaceholder.parent as? ViewGroup)?.removeView(xmlPlaceholder)
+        }
+
+        webView = obtainDetachedSingletonWebView(this)
+
+        // CRITICAL CRASH GUARD: Ensure webView has no parent before adding to rootContainer
+        if (webView.parent != null) {
+            (webView.parent as? ViewGroup)?.removeView(webView)
+        }
+
+        rootContainer.addView(
+            webView,
+            0,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        if (!isWebViewConfigured) {
+            configureHighPerformanceWebView()
+            isWebViewConfigured = true
+        } else {
+            // Re-bind callbacks and theme to current Activity instance without reloading the page
+            setupWebViewClients()
+            applyWebViewTheme(currentThemeMode)
+            applyRendererPriorityPolicySafely()
+        }
+    }
+
+    /**
+     * System #4: Guard Against Duplicate Audio DSP Initialization.
+     * Uses isAudioEngineInitialized boolean flag and full try/catch (Throwable) guards
+     * so re-attaching UI never creates duplicate DynamicsProcessing instances or crashes on Session 0.
+     */
+    private fun initSingletonAudioEngineSafely() {
+        try {
+            if (!isAudioEngineInitialized || singletonAudioEngine == null) {
+                val engine = singletonAudioEngine ?: AppleSignatureAudioEngine(applicationContext).also {
+                    singletonAudioEngine = it
+                }
+                engine.start()
+                isAudioEngineInitialized = true
+            }
+            appleSignatureAudioEngine = singletonAudioEngine
+        } catch (t: Throwable) {
+            Log.w(TAG, "Audio DSP initialization guarded against failure on Session 0", t)
         }
     }
 
@@ -295,6 +398,7 @@ class MainActivity : AppCompatActivity() {
         val cssScript = """
             (function() {
                 var root = document.documentElement;
+                if (!root) return;
                 root.style.setProperty('--safe-area-top', '${lastTopInsetDp}px');
                 root.style.setProperty('--safe-area-bottom', '${lastBottomInsetDp}px');
                 root.style.setProperty('--safe-area-left', '${lastLeftInsetDp}px');
@@ -370,48 +474,12 @@ class MainActivity : AppCompatActivity() {
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(webView, true)
 
-        // 3. 500 MB Dedicated OkHttp Disk Cache & Legacy Cache Purge
+        // 3. Built-In Chromium Cache (No external OkHttp interceptors that could cause dependency or CORS crashes)
+        settings.cacheMode = WebSettings.LOAD_DEFAULT
+
         val customCacheDir = File(applicationContext.cacheDir, "music_beta_webview_cache")
         if (!customCacheDir.exists()) {
             customCacheDir.mkdirs()
-        }
-
-        val okHttpCacheDir = File(applicationContext.cacheDir, "music_okhttp_cache_v4")
-        if (!okHttpCacheDir.exists()) {
-            okHttpCacheDir.mkdirs()
-        }
-
-        val savedSchema = sharedPreferences.getInt(KEY_CACHE_SCHEMA_VERSION, 1)
-        if (savedSchema < CACHE_SCHEMA_VERSION) {
-            try {
-                File(applicationContext.cacheDir, "music_beta_okhttp_cache").deleteRecursively()
-                File(applicationContext.cacheDir, "music_beta_okhttp_cache_v2").deleteRecursively()
-                File(applicationContext.cacheDir, "music_okhttp_cache_v3").deleteRecursively()
-                webView.clearCache(true)
-            } catch (_: Exception) {}
-            sharedPreferences.edit().putInt(KEY_CACHE_SCHEMA_VERSION, CACHE_SCHEMA_VERSION).apply()
-        }
-
-        okHttpClient = OkHttpClient.Builder()
-            .cache(Cache(okHttpCacheDir, DISK_CACHE_MAX_BYTES))
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
-            .followRedirects(true)
-            .followSslRedirects(true)
-            .addNetworkInterceptor { chain ->
-                val response = chain.proceed(chain.request())
-                response.newBuilder()
-                    .removeHeader("Pragma")
-                    .removeHeader("Vary")
-                    .header("Cache-Control", "public, max-age=604800, immutable")
-                    .build()
-            }
-            .build()
-
-        settings.cacheMode = if (isNetworkAvailable()) {
-            WebSettings.LOAD_DEFAULT
-        } else {
-            WebSettings.LOAD_CACHE_ELSE_NETWORK
         }
         manageCacheQuota(customCacheDir, DISK_CACHE_MAX_BYTES)
 
@@ -421,24 +489,37 @@ class MainActivity : AppCompatActivity() {
             settings.offscreenPreRaster = true
         }
 
+        // Background Renderer Priority Policy (API 26+) wrapped in try/catch
+        applyRendererPriorityPolicySafely()
+
         // 4. Widevine-compatible Mobile Chrome User-Agent (never spoof iOS/Safari so Widevine EME works natively)
         settings.userAgentString = MOBILE_CHROME_USER_AGENT
 
-        // 5. Light/Dark Mode configuration on WebView (called once on init, not on every page finish, to prevent image re-decode flicker)
+        // 5. Light/Dark Mode configuration on WebView
         applyWebViewTheme(currentThemeMode)
 
         // 6. JavaScript Interface for Media Session & Background Sync
+        try {
+            webView.removeJavascriptInterface("AndroidBridge")
+        } catch (_: Throwable) {}
         webView.addJavascriptInterface(MusicBridge(), "AndroidBridge")
 
-        // 7. Custom WebViewClient & WebChromeClient (with Widevine DRM Permission Grant)
+        // 7. Custom WebViewClient & WebChromeClient (with Widevine DRM Permission Grant & Renderer Recovery)
         setupWebViewClients()
     }
 
-    private fun isNetworkAvailable(): Boolean {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return true
-        val network = cm.activeNetwork ?: return false
-        val capabilities = cm.getNetworkCapabilities(network) ?: return false
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    /**
+     * System #3: Keep Chromium renderer alive in the background on Android O+ (API 26+)
+     * wrapped inside a try/catch block for guaranteed crash safety.
+     */
+    private fun applyRendererPriorityPolicySafely() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to set WebView renderer priority policy", t)
+            }
+        }
     }
 
     private fun applyWebViewTheme(mode: String) {
@@ -465,14 +546,18 @@ class MainActivity : AppCompatActivity() {
         val themeScript = """
             (function() {
                 const scheme = '$scheme';
-                document.documentElement.style.colorScheme = scheme;
-                let meta = document.querySelector('meta[name="color-scheme"]');
-                if (!meta) {
-                    meta = document.createElement('meta');
-                    meta.name = 'color-scheme';
-                    document.head.appendChild(meta);
+                if (document.documentElement) {
+                    document.documentElement.style.colorScheme = scheme;
                 }
-                meta.content = scheme;
+                if (document.head) {
+                    let meta = document.querySelector('meta[name="color-scheme"]');
+                    if (!meta) {
+                        meta = document.createElement('meta');
+                        meta.name = 'color-scheme';
+                        document.head.appendChild(meta);
+                    }
+                    meta.content = scheme;
+                }
             })();
         """.trimIndent()
         webView.evaluateJavascript(themeScript, null)
@@ -495,7 +580,37 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 progressBar.visibility = View.GONE
-                CookieManager.getInstance().flush()
+
+                // Inject <link rel="preconnect"> tags for low-latency Apple Music API, streaming audio & artwork CDN
+                val preconnectScript = """
+                    (function() {
+                        try {
+                            var head = document.head || document.getElementsByTagName('head')[0];
+                            if (!head) return;
+                            var origins = [
+                                'https://amp-api.music.apple.com',
+                                'https://aod-ssl.itunes.apple.com',
+                                'https://is1-ssl.mzstatic.com'
+                            ];
+                            for (var i = 0; i < origins.length; i++) {
+                                var href = origins[i];
+                                if (!head.querySelector('link[rel="preconnect"][href="' + href + '"]')) {
+                                    var link = document.createElement('link');
+                                    link.rel = 'preconnect';
+                                    link.href = href;
+                                    link.crossOrigin = 'anonymous';
+                                    head.appendChild(link);
+                                }
+                            }
+                        } catch (e) {}
+                    })();
+                """.trimIndent()
+                view?.evaluateJavascript(preconnectScript, null)
+
+                try {
+                    CookieManager.getInstance().flush()
+                } catch (_: Throwable) {}
+
                 injectSafeAreaInsetsScript()
                 injectUiAndMenuFixes()
                 injectAppleSignatureWebAudioScript()
@@ -514,19 +629,7 @@ class MainActivity : AppCompatActivity() {
                     return createEmptyBlockedResponse()
                 }
 
-                // Let Chromium's native HTTP/2 disk cache handle all mzstatic.com images and srcset artwork
-                // directly so category cards never blink or re-render when the floating mini-player updates.
-                if (rawUrl.contains("mzstatic.com", ignoreCase = true)) {
-                    return super.shouldInterceptRequest(view, request)
-                }
-
-                // Only intercept GET requests for immutable JS/CSS/font bundles
-                if (req.method.equals("GET", ignoreCase = true) && isCacheableStaticBundle(rawUrl)) {
-                    fetchFromOkHttpDiskCache(rawUrl, req)?.let { cachedResponse ->
-                        return cachedResponse
-                    }
-                }
-
+                // Let Chromium's native HTTP/2 disk cache (LOAD_DEFAULT) handle all network requests natively
                 return super.shouldInterceptRequest(view, request)
             }
 
@@ -562,6 +665,39 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 return false
+            }
+
+            /**
+             * System #2: Safely recover if the Chromium renderer process is killed by low memory
+             * instead of letting the application crash.
+             */
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                Log.w(TAG, "WebView onRenderProcessGone triggered; recovering WebView safely without app crash")
+                try {
+                    if (view != null) {
+                        if (view.parent != null) {
+                            (view.parent as? ViewGroup)?.removeView(view)
+                        }
+                        view.destroy()
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Error destroying terminated WebView instance", t)
+                }
+
+                singletonWebView = null
+                isWebViewConfigured = false
+
+                runOnUiThread {
+                    try {
+                        attachOrRecoverWebView()
+                        if (webView.url == null) {
+                            webView.loadUrl(APPLE_MUSIC_BETA_URL)
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Failed to re-attach recovered WebView", t)
+                    }
+                }
+                return true
             }
         }
 
@@ -624,76 +760,6 @@ class MainActivity : AppCompatActivity() {
             ),
             ByteArrayInputStream(ByteArray(0))
         )
-    }
-
-    private fun isCacheableStaticBundle(url: String): Boolean {
-        val cleanPath = url.substringBefore('?').lowercase()
-        return cleanPath.endsWith(".js") ||
-            cleanPath.endsWith(".mjs") ||
-            cleanPath.endsWith(".css") ||
-            cleanPath.endsWith(".woff2") ||
-            cleanPath.endsWith(".woff") ||
-            cleanPath.endsWith(".ttf")
-    }
-
-    private fun fetchFromOkHttpDiskCache(targetUrl: String, webRequest: WebResourceRequest): WebResourceResponse? {
-        return try {
-            val requestBuilder = Request.Builder()
-                .url(targetUrl)
-                .header("User-Agent", MOBILE_CHROME_USER_AGENT)
-
-            webRequest.requestHeaders["Accept"]?.let { requestBuilder.header("Accept", it) }
-            webRequest.requestHeaders["Referer"]?.let { requestBuilder.header("Referer", it) }
-
-            if (!isNetworkAvailable()) {
-                requestBuilder.cacheControl(CacheControl.FORCE_CACHE)
-            }
-
-            val response = okHttpClient.newCall(requestBuilder.build()).execute()
-            if (!response.isSuccessful) {
-                response.close()
-                return null
-            }
-
-            val body = response.body ?: return null
-            val contentTypeHeader = response.header("Content-Type", guessMimeType(targetUrl)) ?: "application/octet-stream"
-            val mimeType = contentTypeHeader.substringBefore(';').trim()
-            val encoding = if (contentTypeHeader.contains("charset=", ignoreCase = true)) {
-                contentTypeHeader.substringAfter("charset=", "UTF-8").substringBefore(';').trim()
-            } else {
-                "UTF-8"
-            }
-
-            val responseHeaders = mutableMapOf(
-                "Access-Control-Allow-Origin" to "*",
-                "Access-Control-Allow-Methods" to "GET, HEAD, OPTIONS",
-                "Cache-Control" to "public, max-age=604800, immutable"
-            )
-
-            WebResourceResponse(
-                mimeType,
-                encoding,
-                response.code,
-                response.message.ifEmpty { "OK" },
-                responseHeaders,
-                body.byteStream()
-            )
-        } catch (e: Exception) {
-            Log.w(TAG, "OkHttp cache miss/fallback for $targetUrl: ${e.message}")
-            null
-        }
-    }
-
-    private fun guessMimeType(url: String): String {
-        val clean = url.substringBefore('?').lowercase()
-        return when {
-            clean.endsWith(".js") || clean.endsWith(".mjs") -> "application/javascript"
-            clean.endsWith(".css") -> "text/css"
-            clean.endsWith(".woff2") -> "font/woff2"
-            clean.endsWith(".woff") -> "font/woff"
-            clean.endsWith(".ttf") -> "font/ttf"
-            else -> "application/octet-stream"
-        }
     }
 
     /**
@@ -951,7 +1017,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun executeJavaScript(code: String) {
         runOnUiThread {
-            webView.evaluateJavascript(code, null)
+            try {
+                webView.evaluateJavascript(code, null)
+            } catch (_: Throwable) {}
         }
     }
 
@@ -1018,6 +1086,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val incomingUrl = intent.dataString
+        if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
+            val targetUrl = incomingUrl.replace(
+                Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
+                APPLE_MUSIC_BETA_URL
+            )
+            if (targetUrl != webView.url) {
+                webView.loadUrl(targetUrl)
+            }
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         enforceMaxDisplayRefreshRate()
@@ -1029,7 +1112,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        Log.d(TAG, "onPause called: Keeping audio pipeline alive for background playback")
+        try {
+            CookieManager.getInstance().flush()
+        } catch (_: Throwable) {}
+        Log.d(TAG, "onPause called: Keeping audio pipeline & WebView renderer alive for background playback")
     }
 
     override fun onStop() {
@@ -1039,20 +1125,37 @@ class MainActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        webView.saveState(outState)
-        Log.d(TAG, "WebView navigation history & state saved to Bundle for seamless back/forward restoration")
+        try {
+            webView.saveState(outState)
+        } catch (_: Throwable) {}
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try {
             unregisterReceiver(mediaCommandReceiver)
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
+
+        // Detach Singleton WebView from Activity container and rebind MutableContextWrapper to applicationContext
+        // so the WebView survives UI recompositions/recreations without leaking the Activity or throwing IllegalStateException
         try {
-            appleSignatureAudioEngine?.release()
-            appleSignatureAudioEngine = null
-        } catch (_: Exception) {}
-        webView.destroy()
+            if (::webView.isInitialized && webView.parent != null) {
+                (webView.parent as? ViewGroup)?.removeView(webView)
+            }
+            singletonContextWrapper?.baseContext = applicationContext
+        } catch (t: Throwable) {
+            Log.w(TAG, "Error detaching singleton WebView in onDestroy", t)
+        }
+
+        // Only release global audio DSP if the user is truly finishing the app (not recomposing or rotating)
+        if (isFinishing && !isChangingConfigurations && !isPlayingAudio) {
+            try {
+                singletonAudioEngine?.release()
+                singletonAudioEngine = null
+                appleSignatureAudioEngine = null
+                isAudioEngineInitialized = false
+            } catch (_: Throwable) {}
+        }
     }
 
     private fun setupBackNavigation() {
@@ -1097,7 +1200,11 @@ class MainActivity : AppCompatActivity() {
     fun onRetryClicked(view: View) {
         errorLayout.visibility = View.GONE
         progressBar.visibility = View.VISIBLE
-        webView.reload()
+        if (webView.url == null) {
+            webView.loadUrl(APPLE_MUSIC_BETA_URL)
+        } else {
+            webView.reload()
+        }
     }
 }
 
@@ -1107,6 +1214,7 @@ class MainActivity : AppCompatActivity() {
  *   so hardware-decoded Widevine DRM WebView streams receive full 5-band Pre-EQ/Post-EQ and Anti-Clip Limiter.
  * - Android 14+ (API 34+) Bit-Perfect USB DAC / Headset Bypass via AudioManager.registerAudioDeviceCallback
  *   and AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT (44.1kHz PCM Float).
+ * - Guarded with isAudioEngineInitialized and full try/catch (Throwable) blocks to prevent duplicate initialization or crashes.
  */
 class AppleSignatureAudioEngine(context: Context) {
 
@@ -1122,6 +1230,8 @@ class AppleSignatureAudioEngine(context: Context) {
         appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    @Volatile
+    private var isAudioEngineInitialized: Boolean = false
     private var dynamicsProcessing: DynamicsProcessing? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
 
@@ -1132,9 +1242,19 @@ class AppleSignatureAudioEngine(context: Context) {
             .build()
     }
 
+    @Synchronized
     fun start() {
-        initDynamicsProcessingMasteringEngine()
-        registerUsbBitPerfectCallback()
+        if (isAudioEngineInitialized) {
+            Log.d(TAG, "AppleSignatureAudioEngine already initialized; skipping duplicate Session 0 attachment")
+            return
+        }
+        try {
+            initDynamicsProcessingMasteringEngine()
+            registerUsbBitPerfectCallback()
+            isAudioEngineInitialized = true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to start AppleSignatureAudioEngine safely", t)
+        }
     }
 
     /**
@@ -1149,10 +1269,9 @@ class AppleSignatureAudioEngine(context: Context) {
      */
     private fun initDynamicsProcessingMasteringEngine() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+        if (dynamicsProcessing != null) return
 
         try {
-            dynamicsProcessing?.release()
-
             val configBuilder = DynamicsProcessing.Config.Builder(
                 DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
                 CHANNEL_COUNT,
@@ -1202,8 +1321,8 @@ class AppleSignatureAudioEngine(context: Context) {
                 setEnabled(true)
             }
             Log.i(TAG, "AppleSignatureAudioEngine: DynamicsProcessing enabled on Session 0")
-        } catch (e: Exception) {
-            Log.w(TAG, "DynamicsProcessing Session 0 unavailable on this OEM build: ${e.message}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "DynamicsProcessing Session 0 unavailable on this OEM build: ${t.message}")
         }
     }
 
@@ -1243,8 +1362,8 @@ class AppleSignatureAudioEngine(context: Context) {
         audioDeviceCallback = callback
         try {
             manager.registerAudioDeviceCallback(callback, mainHandler)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to register AudioDeviceCallback: ${e.message}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to register AudioDeviceCallback: ${t.message}")
         }
     }
 
@@ -1281,8 +1400,8 @@ class AppleSignatureAudioEngine(context: Context) {
                 preferredBitPerfect
             )
             Log.i(TAG, "Android 14+ Bit-Perfect USB DAC mode applied=$applied for device=${usbDevice.productName}")
-        } catch (e: Exception) {
-            Log.w(TAG, "Bit-Perfect USB mixer configuration not supported by DAC: ${e.message}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Bit-Perfect USB mixer configuration not supported by DAC: ${t.message}")
         }
     }
 
@@ -1291,21 +1410,23 @@ class AppleSignatureAudioEngine(context: Context) {
         try {
             manager.clearPreferredMixerAttributes(mediaAudioAttributes, usbDevice)
             Log.i(TAG, "Cleared Bit-Perfect mixer attributes for disconnected USB DAC: ${usbDevice.productName}")
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
     }
 
+    @Synchronized
     fun release() {
         try {
             audioDeviceCallback?.let { cb ->
                 audioManager?.unregisterAudioDeviceCallback(cb)
             }
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
         audioDeviceCallback = null
 
         try {
             dynamicsProcessing?.setEnabled(false)
             dynamicsProcessing?.release()
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
         dynamicsProcessing = null
+        isAudioEngineInitialized = false
     }
 }

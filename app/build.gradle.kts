@@ -66,9 +66,8 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.0")
     implementation("androidx.coordinatorlayout:coordinatorlayout:1.2.0")
 
-    // High-Performance WebView & OkHttp Aggressive Disk Cache Interceptor
+    // High-Performance WebView (100% Standard Android SDK + AndroidX WebKit, zero external network interceptors)
     implementation("androidx.webkit:webkit:1.11.0")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // MediaSession & Foreground Media Notification (Android 14+ compliant)
     implementation("androidx.media:media:1.7.0")
