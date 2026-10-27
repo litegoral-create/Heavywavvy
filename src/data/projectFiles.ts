@@ -42,8 +42,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -399,7 +399,7 @@ class MainActivity : AppCompatActivity() {
             val incomingUrl = intent?.dataString
             val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
                 incomingUrl.replace(
-                    Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
+                    Regex("^https?://(www\\\\.)?music\\\\.apple\\\\.com", RegexOption.IGNORE_CASE),
                     APPLE_MUSIC_BETA_URL
                 )
             } else {
@@ -750,7 +750,7 @@ class MainActivity : AppCompatActivity() {
                 // Keep navigation inside Apple Music Web Player Beta (https://beta.music.apple.com)
                 if (lower.startsWith("https://music.apple.com") || lower.startsWith("http://music.apple.com")) {
                     val betaUrl = url.replaceFirst(
-                        Regex("^https?://music\\.apple\\.com", RegexOption.IGNORE_CASE),
+                        Regex("^https?://music\\\\.apple\\\\.com", RegexOption.IGNORE_CASE),
                         APPLE_MUSIC_BETA_URL
                     )
                     view?.loadUrl(betaUrl)

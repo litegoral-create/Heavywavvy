@@ -236,6 +236,13 @@ test('getAppleSignatureAudioConfig and generateAppleSignatureWebAudioScript conf
   assert.ok(!mainActivity.content.includes('DynamicsProcessing.Config.VARIANT_FAVOR_FREQUENCY_RESOLUTION'));
   assert.ok(mainActivity.content.includes('setEnabled(true)'));
   assert.ok(mainActivity.content.includes('dynamicsProcessing?.setEnabled(false)'));
+  assert.ok(!mainActivity.content.includes('music\\.apple'));
+  assert.ok(mainActivity.content.includes('music\\\\.apple\\\\.com'));
+
+  const fs = await import('node:fs');
+  for (const file of PROJECT_FILES) {
+    assert.equal(fs.existsSync(file.path), true, `Expected ${file.path} to exist on disk`);
+    const diskContent = fs.readFileSync(file.path, 'utf8');
+    assert.equal(diskContent, file.content, `Expected ${file.path} on disk to match PROJECT_FILES`);
+  }
 });
-
-

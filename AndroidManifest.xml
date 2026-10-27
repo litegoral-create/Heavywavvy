@@ -29,13 +29,13 @@
         android:usesCleartextTraffic="false"
         tools:targetApi="34">
 
-        <!-- Main Wrapper Activity with Edge-to-Edge and High Refresh Rate -->
+        <!-- Main Wrapper Activity with Edge-to-Edge, High Refresh Rate & Zero-Reload SPA Lifecycle -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:hardwareAccelerated="true"
             android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

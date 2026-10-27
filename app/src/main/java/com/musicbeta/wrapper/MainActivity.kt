@@ -203,7 +203,7 @@ class MainActivity : AppCompatActivity() {
             val incomingUrl = intent?.dataString
             val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
                 incomingUrl.replace(
-                    Regex("^https?://(www\.)?music\.apple\.com", RegexOption.IGNORE_CASE),
+                    Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
                     APPLE_MUSIC_BETA_URL
                 )
             } else {
@@ -461,9 +461,10 @@ class MainActivity : AppCompatActivity() {
             WebSettingsCompat.setForceDark(webView.settings, forceDarkValue)
         }
 
+        val scheme = if (isDark) "dark" else "light"
         val themeScript = """
             (function() {
-                const scheme = '${if (isDark) "dark" else "light"}';
+                const scheme = '$scheme';
                 document.documentElement.style.colorScheme = scheme;
                 let meta = document.querySelector('meta[name="color-scheme"]');
                 if (!meta) {
@@ -553,7 +554,7 @@ class MainActivity : AppCompatActivity() {
                 // Keep navigation inside Apple Music Web Player Beta (https://beta.music.apple.com)
                 if (lower.startsWith("https://music.apple.com") || lower.startsWith("http://music.apple.com")) {
                     val betaUrl = url.replaceFirst(
-                        Regex("^https?://music\.apple\.com", RegexOption.IGNORE_CASE),
+                        Regex("^https?://music\\.apple\\.com", RegexOption.IGNORE_CASE),
                         APPLE_MUSIC_BETA_URL
                     )
                     view?.loadUrl(betaUrl)
@@ -1153,7 +1154,7 @@ class AppleSignatureAudioEngine(context: Context) {
             dynamicsProcessing?.release()
 
             val configBuilder = DynamicsProcessing.Config.Builder(
-                DynamicsProcessing.Config.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
                 CHANNEL_COUNT,
                 true,  // preEqInUse
                 EQ_BAND_COUNT,
@@ -1198,7 +1199,7 @@ class AppleSignatureAudioEngine(context: Context) {
             configBuilder.setLimiterAllChannelsTo(limiter)
 
             dynamicsProcessing = DynamicsProcessing(0, GLOBAL_AUDIO_SESSION_ID, configBuilder.build()).apply {
-                enabled = true
+                setEnabled(true)
             }
             Log.i(TAG, "AppleSignatureAudioEngine: DynamicsProcessing enabled on Session 0")
         } catch (e: Exception) {
@@ -1302,7 +1303,7 @@ class AppleSignatureAudioEngine(context: Context) {
         audioDeviceCallback = null
 
         try {
-            dynamicsProcessing?.enabled = false
+            dynamicsProcessing?.setEnabled(false)
             dynamicsProcessing?.release()
         } catch (_: Exception) {}
         dynamicsProcessing = null
