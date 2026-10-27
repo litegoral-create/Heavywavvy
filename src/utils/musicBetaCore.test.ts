@@ -251,6 +251,14 @@ test('getAppleSignatureAudioConfig and generateAppleSignatureWebAudioScript conf
   assert.ok(mainActivity.content.includes('dynamicsProcessing?.setEnabled(false)'));
   assert.ok(!mainActivity.content.includes('music\\.apple'));
   assert.ok(mainActivity.content.includes('music\\\\.apple\\\\.com'));
+  assert.ok(mainActivity.content.includes('setAcceptThirdPartyCookies(targetWebView, true)'));
+  assert.ok(mainActivity.content.includes('setSupportZoom(true)'));
+  assert.ok(mainActivity.content.includes('builtInZoomControls = true'));
+  assert.ok(mainActivity.content.includes('displayZoomControls = false'));
+  assert.ok(mainActivity.content.includes('override fun onReceivedHttpAuthRequest'));
+  assert.ok(mainActivity.content.includes('override fun doUpdateVisitedHistory'));
+  assert.ok(mainActivity.content.includes('override fun onCreateWindow'));
+  assert.ok(mainActivity.content.includes('isRedirectLoopDetected'));
 
   const buildGradle = PROJECT_FILES.find((f) => f.path === 'app/build.gradle.kts');
   assert.ok(buildGradle);

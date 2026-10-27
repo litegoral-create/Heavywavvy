@@ -23,12 +23,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Message
 import android.util.Log
 import android.view.Display
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
+import android.webkit.HttpAuthHandler
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
@@ -59,24 +61,23 @@ import java.io.File
  * MainActivity for MusicBetaWrapper (v1.1.0).
  * High-performance, zero-reload, edge-to-edge native Android 14 wrapper around https://beta.music.apple.com
  *
- * Integrated Audio, Persistence & Crash-Safety Systems:
- * 1. Crash-Safe WebView Singleton Re-Attachment:
+ * Integrated Audio, Auth Cookie Persistence, DRM & Crash-Safety Systems:
+ * 1. Cookie Persistence & Cross-Domain Auth (idmsa.apple.com -> music.apple.com / beta.music.apple.com):
+ *    - Enables global cookies and third-party cookies (CookieManager.setAcceptThirdPartyCookies(webView, true))
+ *      on both the primary WebView and any OAuth sign-in popup WebViews.
+ *    - Flushes cookies to persistent SQLite disk storage (CookieManager.getInstance().flush()) on page start,
+ *      cross-domain history updates (doUpdateVisitedHistory), page finish, and lifecycle pause.
+ * 2. Crash-Safe WebView Singleton Re-Attachment:
  *    - Retains a single WebView instance across UI recompositions/navigation using MutableContextWrapper(context.applicationContext).
  *    - Always executes if (webView.parent != null) { (webView.parent as? ViewGroup)?.removeView(webView) } before attaching.
  *    - Only calls webView.loadUrl(...) if webView.url == null so an already loaded session never reloads.
- * 2. Widevine DRM & WebView Audio Optimization:
- *    - Grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID in WebChromeClient with a Widevine-compatible Mobile Chrome User-Agent.
- * 3. MusicKit JS High-Bitrate (256kbps AAC), Preconnect Injection & Web Audio 32-Bit Float Mastering:
- *    - Injects <link rel="preconnect"> tags for amp-api.music.apple.com, aod-ssl.itunes.apple.com, and is1-ssl.mzstatic.com + CookieManager.flush().
- *    - Polls window.MusicKit, forces music.bitrate = MusicKit.PlaybackBitrate.HIGH (256kbps AAC) & localStorage['music.ampwebplay.bitrate'] = '256',
- *      and safely hooks <audio> elements into a 32-bit float AudioContext (65Hz +1.8dB warmth, 13.5kHz +2.0dB air, soft-knee compressor)
- *      with automatic fallback to Native Android DSP if Widevine EME blocks createMediaElementSource CORS.
- *    - Implements WebViewClient.onRenderProcessGone returning true to recover gracefully without crashing on low memory.
- * 4. Built-In Chromium Cache & Background Renderer Priority:
- *    - Uses WebSettings.LOAD_DEFAULT + domStorageEnabled = true (zero external OkHttp interceptors) and sets
- *      WebView.RENDERER_PRIORITY_IMPORTANT on API 26+ inside try/catch.
- * 5. Native Android DynamicsProcessing Mastering Engine (API 28+, Session 0) & Android 14+ Bit-Perfect USB DAC Bypass:
- *    - Guarded by isAudioEngineInitialized and full try/catch (Throwable) blocks so re-attaching UI never creates duplicate effects on Session 0.
+ * 3. Widevine DRM, OAuth Popup Windows & WebView Audio Optimization:
+ *    - Grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID in WebChromeClient with a clean Widevine-compatible Chrome User-Agent.
+ *    - Handles multi-window Apple ID OAuth popups (onCreateWindow / onCloseWindow) so sign-in tokens post back seamlessly.
+ * 4. SSL, HTTP Auth & Redirect Loop Prevention:
+ *    - Preserves Set-Cookie headers across 302 redirects by never calling view.loadUrl() mid-redirect on https:// URLs.
+ *    - Guards against infinite redirect loops with a sliding-window timestamp detector and preserves credentials in onReceivedHttpAuthRequest.
+ * 5. MusicKit JS High-Bitrate (256kbps AAC), Preconnect Injection & Native Android DynamicsProcessing DSP (Session 0) + Bit-Perfect USB DAC.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -86,6 +87,10 @@ class MainActivity : AppCompatActivity() {
         private const val NOTIFICATION_PERMISSION_CODE = 1001
         private const val DISK_CACHE_MAX_BYTES = 500L * 1024L * 1024L // 500 MB
 
+        // Redirect Loop Protection Constants
+        private const val REDIRECT_LOOP_WINDOW_MS = 8_000L
+        private const val MAX_RAPID_REDIRECTS = 4
+
         // Preferences for Light/Dark Mode
         private const val PREFS_NAME = "music_wrapper_prefs"
         private const val KEY_THEME_MODE = "pref_theme_mode"
@@ -93,7 +98,7 @@ class MainActivity : AppCompatActivity() {
         const val THEME_LIGHT = "light"
         const val THEME_DARK = "dark"
 
-        // Widevine-compatible Mobile Chrome on Android 14 User-Agent (NEVER spoof iOS/Safari so Widevine EME works natively)
+        // Clean Widevine-compatible Mobile Chrome User-Agent (strips Android "; wv" token so Apple ID & DRM never reject the WebView)
         const val MOBILE_CHROME_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
         // Broadcast actions between Activity and MediaPlaybackService
@@ -173,6 +178,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var insetsController: WindowInsetsControllerCompat
     private lateinit var sharedPreferences: SharedPreferences
     private var appleSignatureAudioEngine: AppleSignatureAudioEngine? = null
+    private var oauthPopupWebView: WebView? = null
+
+    // Tracks recent redirect timestamps per normalized URL to prevent infinite redirect loops
+    private val redirectHistoryMap = HashMap<String, MutableList<Long>>()
 
     private var currentRefreshRate: Float = 60.0f
     private var isPlayingAudio: Boolean = false
@@ -291,7 +300,8 @@ class MainActivity : AppCompatActivity() {
             configureHighPerformanceWebView()
             isWebViewConfigured = true
         } else {
-            // Re-bind callbacks and theme to current Activity instance without reloading the page
+            // Re-bind callbacks, third-party cookies, and theme to current Activity instance without reloading the page
+            configurePersistentCookies(webView)
             setupWebViewClients()
             applyWebViewTheme(currentThemeMode)
             applyRendererPriorityPolicySafely()
@@ -443,6 +453,35 @@ class MainActivity : AppCompatActivity() {
         AppCompatDelegate.setDefaultNightMode(nightMode)
     }
 
+    /**
+     * Requirement 1: Cookie Persistence & Cross-Domain Auth Configuration.
+     * Enables first-party and third-party cookies so authentication tokens (media-user-token, myacinfo, itspod)
+     * issued by idmsa.apple.com / appleid.apple.com / buy.itunes.apple.com persist across redirects to
+     * music.apple.com and beta.music.apple.com without dropping the session.
+     */
+    private fun configurePersistentCookies(targetWebView: WebView) {
+        try {
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(targetWebView, true)
+            CookieManager.setAcceptFileSchemeCookies(false)
+            cookieManager.flush()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Error configuring CookieManager for cross-domain auth", t)
+        }
+    }
+
+    /**
+     * Flushes in-memory Chromium cookies to persistent SQLite disk storage immediately.
+     */
+    private fun flushCookiesSafely() {
+        try {
+            CookieManager.getInstance().flush()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to flush CookieManager to disk", t)
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureHighPerformanceWebView() {
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
@@ -451,30 +490,35 @@ class MainActivity : AppCompatActivity() {
 
         val settings = webView.settings
 
-        // 1. Widevine DRM & WebView Audio Optimization + Native Mobile Viewport
+        // 1. Cookie Persistence & Cross-Domain Auth (idmsa.apple.com <-> beta.music.apple.com)
+        configurePersistentCookies(webView)
+
+        // 2. WebSettings Configuration: JS, DOM Storage, Database, & Viewport Zoom Controls
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         @Suppress("DEPRECATION")
         settings.databaseEnabled = true
-        // Use 1:1 native mobile viewport metrics so top headers and search bars are never scaled or clipped
-        settings.useWideViewPort = false
-        settings.loadWithOverviewMode = false
+
+        // Enable responsive viewport & pinch-to-zoom controls while hiding legacy on-screen zoom buttons
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+        settings.setSupportZoom(true)
+        settings.builtInZoomControls = true
+        settings.displayZoomControls = false
         settings.layoutAlgorithm = WebSettings.LayoutAlgorithm.NORMAL
 
-        // 2. Mixed Content, Autoplay without Gesture & Third-Party Cookies for Apple CDN (mzstatic.com) & MusicKit Auth
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        // 3. Media & DRM Playback + OAuth Multi-Window Support
+        // Allow autoplay without user gesture and allow Apple ID OAuth sign-in popups
+        settings.mediaPlaybackRequiresUserGesture = false
+        settings.javaScriptCanOpenWindowsAutomatically = true
+        settings.setSupportMultipleWindows(true)
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         settings.loadsImagesAutomatically = true
         settings.blockNetworkImage = false
-        settings.mediaPlaybackRequiresUserGesture = false
-        settings.setSupportMultipleWindows(false)
         settings.allowFileAccess = false
         settings.allowContentAccess = false
 
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.setAcceptCookie(true)
-        cookieManager.setAcceptThirdPartyCookies(webView, true)
-
-        // 3. Built-In Chromium Cache (No external OkHttp interceptors that could cause dependency or CORS crashes)
+        // 4. Built-In Chromium Cache (No external OkHttp interceptors that could strip Cookie headers or break CORS)
         settings.cacheMode = WebSettings.LOAD_DEFAULT
 
         val customCacheDir = File(applicationContext.cacheDir, "music_beta_webview_cache")
@@ -492,19 +536,22 @@ class MainActivity : AppCompatActivity() {
         // Background Renderer Priority Policy (API 26+) wrapped in try/catch
         applyRendererPriorityPolicySafely()
 
-        // 4. Widevine-compatible Mobile Chrome User-Agent (never spoof iOS/Safari so Widevine EME works natively)
-        settings.userAgentString = MOBILE_CHROME_USER_AGENT
+        // 5. Clean Widevine-compatible Chrome User-Agent (removes "; wv" token so Apple ID & MusicKit DRM never block the client)
+        val defaultUa = WebSettings.getDefaultUserAgent(applicationContext)
+            .replace("; wv", "")
+            .replace(Regex("Version/\\d+\\.\\d+\\s*"), "")
+        settings.userAgentString = if (defaultUa.contains("Chrome/")) defaultUa else MOBILE_CHROME_USER_AGENT
 
-        // 5. Light/Dark Mode configuration on WebView
+        // 6. Light/Dark Mode configuration on WebView
         applyWebViewTheme(currentThemeMode)
 
-        // 6. JavaScript Interface for Media Session & Background Sync
+        // 7. JavaScript Interface for Media Session & Background Sync
         try {
             webView.removeJavascriptInterface("AndroidBridge")
         } catch (_: Throwable) {}
         webView.addJavascriptInterface(MusicBridge(), "AndroidBridge")
 
-        // 7. Custom WebViewClient & WebChromeClient (with Widevine DRM Permission Grant & Renderer Recovery)
+        // 8. Custom WebViewClient & WebChromeClient (Auth Redirects, Widevine DRM & Renderer Recovery)
         setupWebViewClients()
     }
 
@@ -563,16 +610,40 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript(themeScript, null)
     }
 
+    /**
+     * Detects rapid identical redirects within REDIRECT_LOOP_WINDOW_MS so the WebView never gets
+     * stuck in an infinite auth redirect loop.
+     */
+    private fun isRedirectLoopDetected(url: String): Boolean {
+        val now = System.currentTimeMillis()
+        val normalizedKey = url.substringBefore("#")
+        val timestamps = redirectHistoryMap.getOrPut(normalizedKey) { mutableListOf() }
+        timestamps.removeAll { now - it > REDIRECT_LOOP_WINDOW_MS }
+        timestamps.add(now)
+        return timestamps.size > MAX_RAPID_REDIRECTS
+    }
+
     private fun setupWebViewClients() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 progressBar.visibility = View.VISIBLE
                 errorLayout.visibility = View.GONE
+                flushCookiesSafely()
+            }
+
+            /**
+             * Flush cookies on every SPA state push and cross-domain redirect (e.g. idmsa.apple.com -> beta.music.apple.com)
+             * so auth tokens are written to disk before the next route reads them.
+             */
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                flushCookiesSafely()
             }
 
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 super.onPageCommitVisible(view, url)
+                flushCookiesSafely()
                 injectSafeAreaInsetsScript()
                 injectUiAndMenuFixes()
             }
@@ -607,14 +678,34 @@ class MainActivity : AppCompatActivity() {
                 """.trimIndent()
                 view?.evaluateJavascript(preconnectScript, null)
 
-                try {
-                    CookieManager.getInstance().flush()
-                } catch (_: Throwable) {}
+                // Requirement 1: Flush session & MusicKit auth cookies to persistent storage upon page finish
+                flushCookiesSafely()
 
                 injectSafeAreaInsetsScript()
                 injectUiAndMenuFixes()
                 injectAppleSignatureWebAudioScript()
                 injectAudioBridgeScript()
+            }
+
+            /**
+             * Requirement 4: Handle HTTP authentication requests without stripping existing session cookies.
+             */
+            override fun onReceivedHttpAuthRequest(
+                view: WebView?,
+                handler: HttpAuthHandler?,
+                host: String?,
+                realm: String?
+            ) {
+                flushCookiesSafely()
+                if (view != null && handler != null && handler.useHttpAuthUsernamePassword() && host != null && realm != null) {
+                    @Suppress("DEPRECATION")
+                    val credentials = view.getHttpAuthUsernamePassword(host, realm)
+                    if (credentials != null && credentials.size == 2) {
+                        handler.proceed(credentials[0], credentials[1])
+                        return
+                    }
+                }
+                super.onReceivedHttpAuthRequest(view, handler, host, realm)
             }
 
             override fun shouldInterceptRequest(
@@ -640,30 +731,49 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            /**
+             * Requirement 4: Cookie-Preserving Redirect Handling & Loop Prevention.
+             * - Blocks custom native app deep-link schemes (music://, itms://, itms-apps://, intent://) so the OS
+             *   never hijacks authentication into an external app.
+             * - Allows all standard HTTPS authentication and media domains (idmsa.apple.com, appleid.apple.com,
+             *   buy.itunes.apple.com, itunes.apple.com, music.apple.com, beta.music.apple.com) to load natively
+             *   by returning false. Never calls view.loadUrl() mid-redirect, which would abort the in-flight HTTP 302
+             *   response and strip Set-Cookie headers.
+             */
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val url = request?.url?.toString() ?: return false
-                val lower = url.lowercase()
+                val uri = request?.url ?: return false
+                val url = uri.toString()
+                val scheme = uri.scheme?.lowercase() ?: ""
 
-                // Block external native app deep links ("Open in Music" / itunes / market intents)
-                if (lower.startsWith("music://") ||
-                    lower.startsWith("itms://") ||
-                    lower.startsWith("itms-apps://") ||
-                    lower.startsWith("intent://") ||
-                    lower.contains("itunes.apple.com")
+                // 1. Block non-web native app deep links ("Open in Music" / App Store intents)
+                if (scheme == "music" ||
+                    scheme == "itms" ||
+                    scheme == "itms-apps" ||
+                    scheme == "itms-appss" ||
+                    scheme == "intent" ||
+                    scheme == "market"
                 ) {
+                    Log.i(TAG, "Blocked external deep-link scheme to preserve WebView session: $url")
                     return true
                 }
 
-                // Keep navigation inside Apple Music Web Player Beta (https://beta.music.apple.com)
-                if (lower.startsWith("https://music.apple.com") || lower.startsWith("http://music.apple.com")) {
-                    val betaUrl = url.replaceFirst(
-                        Regex("^https?://music\\.apple\\.com", RegexOption.IGNORE_CASE),
-                        APPLE_MUSIC_BETA_URL
-                    )
-                    view?.loadUrl(betaUrl)
+                // Only allow http/https navigation inside the WebView
+                if (scheme != "https" && scheme != "http") {
                     return true
                 }
 
+                // 2. Prevent infinite redirect loops while preserving cookies
+                if (request.isRedirect && isRedirectLoopDetected(url)) {
+                    Log.w(TAG, "Redirect loop detected and halted for URL: $url")
+                    flushCookiesSafely()
+                    view?.stopLoading()
+                    return true
+                }
+
+                // 3. Flush cookies across domain transitions (e.g., idmsa.apple.com -> beta.music.apple.com)
+                flushCookiesSafely()
+
+                // Return false so WebView follows redirects natively with all Set-Cookie & Authorization headers intact
                 return false
             }
 
@@ -710,7 +820,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             /**
-             * System #1: Enable Widevine DRM Audio Playback.
+             * Requirement 3: Enable Widevine DRM Audio Playback.
              * Automatically grants PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID so encrypted
              * full-length 256kbps AAC Apple Music streams play without falling back to 30-second previews.
              */
@@ -736,9 +846,115 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            /**
+             * Requirement 1 & 3: Support OAuth Sign-In Popup Windows (idmsa.apple.com / appleid.apple.com).
+             * Apple Music Web Player opens its Apple ID sign-in flow in a secondary window via window.open().
+             * Hosting this child WebView in-app with third-party cookies enabled ensures the 2FA token and
+             * media-user-token are shared with the main WebView and posted back via window.opener.
+             */
+            @SuppressLint("SetJavaScriptEnabled")
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: Message?
+            ): Boolean {
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                val context = view?.context ?: this@MainActivity
+
+                // Clean up any existing OAuth popup before creating a new one
+                closeOAuthPopupWebView()
+
+                val popupWebView = WebView(context).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    @Suppress("DEPRECATION")
+                    settings.databaseEnabled = true
+                    settings.javaScriptCanOpenWindowsAutomatically = true
+                    settings.setSupportMultipleWindows(true)
+                    settings.useWideViewPort = true
+                    settings.loadWithOverviewMode = true
+                    settings.setSupportZoom(true)
+                    settings.builtInZoomControls = true
+                    settings.displayZoomControls = false
+                    settings.userAgentString = webView.settings.userAgentString
+                }
+
+                // Share cookies & third-party cookies between OAuth popup and primary WebView
+                configurePersistentCookies(popupWebView)
+
+                popupWebView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
+                        super.onPageStarted(v, url, favicon)
+                        flushCookiesSafely()
+                    }
+
+                    override fun doUpdateVisitedHistory(v: WebView?, url: String?, isReload: Boolean) {
+                        super.doUpdateVisitedHistory(v, url, isReload)
+                        flushCookiesSafely()
+                    }
+
+                    override fun onPageFinished(v: WebView?, url: String?) {
+                        super.onPageFinished(v, url)
+                        flushCookiesSafely()
+                    }
+
+                    override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
+                        val scheme = req?.url?.scheme?.lowercase() ?: ""
+                        if (scheme != "https" && scheme != "http") {
+                            return true
+                        }
+                        flushCookiesSafely()
+                        return false
+                    }
+                }
+
+                popupWebView.webChromeClient = object : WebChromeClient() {
+                    override fun onCloseWindow(window: WebView?) {
+                        super.onCloseWindow(window)
+                        flushCookiesSafely()
+                        closeOAuthPopupWebView()
+                    }
+                }
+
+                oauthPopupWebView = popupWebView
+                rootContainer.addView(popupWebView)
+
+                transport.webView = popupWebView
+                resultMsg.sendToTarget()
+                return true
+            }
+
+            override fun onCloseWindow(window: WebView?) {
+                super.onCloseWindow(window)
+                flushCookiesSafely()
+                closeOAuthPopupWebView()
+            }
+
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                 Log.d(TAG, "WebView Console: ${consoleMessage?.message()} (line ${consoleMessage?.lineNumber()})")
                 return true
+            }
+        }
+    }
+
+    private fun closeOAuthPopupWebView() {
+        runOnUiThread {
+            try {
+                oauthPopupWebView?.let { popup ->
+                    flushCookiesSafely()
+                    (popup.parent as? ViewGroup)?.removeView(popup)
+                    popup.stopLoading()
+                    popup.destroy()
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Error closing OAuth popup WebView", t)
+            } finally {
+                oauthPopupWebView = null
             }
         }
     }
@@ -814,7 +1030,7 @@ class MainActivity : AppCompatActivity() {
                     '  -webkit-backdrop-filter: none !important;',
                     '}',
                     '/* 4. Hide Open in Music & Exit Beta links so user stays inside Apple Music Beta */',
-                    '.upsell-banner, [data-testid="upsell-banner"], [data-testid*="exit-beta"], [class*="upsell"], [class*="smart-banner"], .native-upsell, a[href*="itunes.apple.com"], a[href*="music://"], a[href*="itms://"], a[href*="exit-beta"], button[aria-label*="Open in Music"], button[aria-label*="Exit Beta"] {',
+                    '.upsell-banner, [data-testid="upsell-banner"], [data-testid*="exit-beta"], [class*="upsell"], [class*="smart-banner"], .native-upsell, a[href^="music://"], a[href^="itms://"], a[href^="itms-apps://"], a[href*="exit-beta"], button[aria-label*="Open in Music"], button[aria-label*="Exit Beta"] {',
                     '  display: none !important;',
                     '  height: 0 !important;',
                     '  max-height: 0 !important;',
