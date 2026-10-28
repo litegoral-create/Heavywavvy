@@ -585,4 +585,126 @@ export function generateAppleSignatureWebAudioScript(): string {
   })();`;
 }
 
+export type SoundProfileId = 'apple_studio' | 'bass_boost' | 'vocal_clarity' | 'late_night' | 'flat_bypass';
+
+export interface SoundProfilePreset {
+  id: SoundProfileId;
+  name: string;
+  description: string;
+  preampDb: number;
+  gainsDb: [number, number, number, number, number]; // [80Hz, 250Hz, 1kHz, 3.5kHz, 12kHz+]
+}
+
+export const SOUND_PROFILE_PRESETS: Record<SoundProfileId, SoundProfilePreset> = {
+  apple_studio: {
+    id: 'apple_studio',
+    name: 'Apple Signature Studio',
+    description: 'Reference warm sub-bass (+2.0dB), de-mudded 250Hz (-0.5dB), and airy 12kHz+ (+2.2dB)',
+    preampDb: 0.0,
+    gainsDb: [2.0, -0.5, 0.0, 1.0, 2.2],
+  },
+  bass_boost: {
+    id: 'bass_boost',
+    name: 'Deep Sub-Bass Boost',
+    description: 'Extended low-end punch (+4.5dB at 80Hz) with clean midrange and anti-clip limiting',
+    preampDb: -1.0,
+    gainsDb: [4.5, 1.0, 0.0, 0.8, 1.8],
+  },
+  vocal_clarity: {
+    id: 'vocal_clarity',
+    name: 'Vocal & Acoustic Clarity',
+    description: 'Forward lead vocals (+2.6dB at 3.5kHz) and crisp acoustic detail',
+    preampDb: 0.0,
+    gainsDb: [0.5, -1.2, 1.2, 2.6, 2.0],
+  },
+  late_night: {
+    id: 'late_night',
+    name: 'Late Night Loudness',
+    description: 'Fletcher-Munson low-volume compensation boosting subtle bass & treble details',
+    preampDb: 1.5,
+    gainsDb: [3.2, 0.0, 0.5, 1.8, 3.0],
+  },
+  flat_bypass: {
+    id: 'flat_bypass',
+    name: 'Flat / Reference Bypass',
+    description: 'Bit-transparent 0.0dB flat response across all 5 bands',
+    preampDb: 0.0,
+    gainsDb: [0.0, 0.0, 0.0, 0.0, 0.0],
+  },
+};
+
+export function resolveEqPresetBands(
+  profileId: SoundProfileId,
+  customGainsDb?: [number, number, number, number, number]
+): AppleSignatureAudioBand[] {
+  const preset = SOUND_PROFILE_PRESETS[profileId] || SOUND_PROFILE_PRESETS.apple_studio;
+  const gains = customGainsDb || preset.gainsDb;
+  const cutoffs = [80.0, 250.0, 1000.0, 3500.0, 20000.0];
+  const labels = [
+    'Sub-bass warmth (<80Hz)',
+    'Lower-mids clarity (250Hz)',
+    'Reference midrange (1kHz)',
+    'Vocal presence (3.5kHz)',
+    'High-resolution Air (>12kHz)',
+  ];
+
+  return gains.map((gain, index) => ({
+    index,
+    label: labels[index],
+    cutoffHz: cutoffs[index],
+    preEqGainDb: index <= 1 ? gain : 0.0,
+    postEqGainDb: index >= 2 ? gain : 0.0,
+    netGainDb: gain,
+  }));
+}
+
+/**
+ * Upgrades Apple Music artwork URLs to high-resolution 600x600bb.jpg for crisp Android Lock-Screen
+ * and MediaStyle Notification display.
+ */
+export function upgradeLockScreenArtworkUrl(url: string): string {
+  if (!url) return '';
+  return url
+    .replace(/\/\d{2,4}x\d{2,4}([a-z]{0,4})\.(jpg|jpeg|webp|png)/i, '/600x600bb.jpg')
+    .replace(/\{w\}x\{h\}([a-z]{0,4})\.(jpg|jpeg|webp|png)/i, '600x600$1.$2');
+}
+
+/**
+ * Calculates the smooth 10-second fade-out volume multiplier (0.0 to 1.0) when the Sleep Timer
+ * approaches 0 remaining seconds.
+ */
+export function calculateSleepTimerFadeMultiplier(
+  remainingSeconds: number,
+  fadeWindowSeconds: number = 10
+): number {
+  if (remainingSeconds <= 0) return 0.0;
+  if (remainingSeconds >= fadeWindowSeconds) return 1.0;
+  return Number((remainingSeconds / fadeWindowSeconds).toFixed(2));
+}
+
+export type NetworkTransportType = 'wifi' | 'cellular' | 'ethernet';
+
+/**
+ * Resolves the target MusicKit stream bitrate (256kbps High vs 64kbps Data Saver)
+ * based on active network transport and user's Cellular Data Saver preference.
+ */
+export function resolveAdaptiveBitrate(
+  transport: NetworkTransportType,
+  cellularDataSaverEnabled: boolean
+): { bitrateKbps: 256 | 64; musicKitConst: 'HIGH' | 'STANDARD'; label: string } {
+  if (transport === 'cellular' && cellularDataSaverEnabled) {
+    return {
+      bitrateKbps: 64,
+      musicKitConst: 'STANDARD',
+      label: '64kbps HE-AAC (Cellular Saver)',
+    };
+  }
+  return {
+    bitrateKbps: 256,
+    musicKitConst: 'HIGH',
+    label: '256kbps AAC (High Quality)',
+  };
+}
+
+
 

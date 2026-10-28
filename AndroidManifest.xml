@@ -59,6 +59,13 @@
                     android:scheme="https"
                     android:host="music.apple.com" />
             </intent-filter>
+
+            <!-- Universal Song Link Share Sheet Resolver (Open shared Apple Music links directly in Beta wrapper) -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
         </activity>
 
         <!-- Media Playback Foreground Service for uninterrupted background streaming -->

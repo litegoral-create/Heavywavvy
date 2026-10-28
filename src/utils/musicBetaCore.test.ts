@@ -264,6 +264,22 @@ test('getAppleSignatureAudioConfig and generateAppleSignatureWebAudioScript conf
   assert.ok(buildGradle);
   assert.ok(!buildGradle.content.includes('okhttp3'));
 
+  const mediaService = PROJECT_FILES.find((f) => f.path.endsWith('MediaPlaybackService.kt'));
+  assert.ok(mediaService);
+  assert.ok(mediaService.content.includes('ACTION_SEEK_TO'));
+  assert.ok(mediaService.content.includes('override fun onSeekTo(pos: Long)'));
+  assert.ok(mediaService.content.includes('upgradeArtworkToHighRes'));
+  assert.ok(mediaService.content.includes('600x600bb.jpg'));
+
+  assert.ok(mainActivity.content.includes('applySoundProfilePreset'));
+  assert.ok(mainActivity.content.includes('setCrossfadeDuration'));
+  assert.ok(mainActivity.content.includes('getActiveAudioOutputStatus'));
+  assert.ok(mainActivity.content.includes('startSleepTimer'));
+  assert.ok(mainActivity.content.includes('triggerHapticFeedback'));
+  assert.ok(mainActivity.content.includes('onLyricsVisibilityChanged'));
+  assert.ok(mainActivity.content.includes('registerAdaptiveNetworkBitrateCallback'));
+  assert.ok(mainActivity.content.includes('resolveIncomingOrSharedUrl'));
+
   const fs = await import('node:fs');
   for (const file of PROJECT_FILES) {
     assert.equal(fs.existsSync(file.path), true, `Expected ${file.path} to exist on disk`);
@@ -271,3 +287,59 @@ test('getAppleSignatureAudioConfig and generateAppleSignatureWebAudioScript conf
     assert.equal(diskContent, file.content, `Expected ${file.path} on disk to match PROJECT_FILES`);
   }
 });
+
+test('Enhancement helpers: 5-band EQ presets, 600x600 artwork upgrader, sleep timer fade-out, and adaptive network bitrate', async () => {
+  const {
+    resolveEqPresetBands,
+    upgradeLockScreenArtworkUrl,
+    calculateSleepTimerFadeMultiplier,
+    resolveAdaptiveBitrate,
+  } = await import('./musicBetaCore');
+
+  assert.deepEqual(
+    resolveEqPresetBands('apple_studio').map((b) => b.netGainDb),
+    [2.0, -0.5, 0.0, 1.0, 2.2]
+  );
+  assert.deepEqual(
+    resolveEqPresetBands('bass_boost').map((b) => b.netGainDb),
+    [4.5, 1.0, 0.0, 0.8, 1.8]
+  );
+  assert.deepEqual(
+    resolveEqPresetBands('flat_bypass').map((b) => b.netGainDb),
+    [0.0, 0.0, 0.0, 0.0, 0.0]
+  );
+  assert.deepEqual(
+    resolveEqPresetBands('apple_studio', [5.0, -2.0, 1.5, 2.5, 3.5]).map((b) => b.netGainDb),
+    [5.0, -2.0, 1.5, 2.5, 3.5]
+  );
+
+  assert.equal(
+    upgradeLockScreenArtworkUrl('https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/100x100bb.jpg'),
+    'https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/600x600bb.jpg'
+  );
+  assert.equal(
+    upgradeLockScreenArtworkUrl('https://is1-ssl.mzstatic.com/image/thumb/{w}x{h}bb.png'),
+    'https://is1-ssl.mzstatic.com/image/thumb/600x600bb.png'
+  );
+
+  assert.equal(calculateSleepTimerFadeMultiplier(25), 1.0);
+  assert.equal(calculateSleepTimerFadeMultiplier(5), 0.5);
+  assert.equal(calculateSleepTimerFadeMultiplier(0), 0.0);
+
+  assert.deepEqual(resolveAdaptiveBitrate('wifi', true), {
+    bitrateKbps: 256,
+    musicKitConst: 'HIGH',
+    label: '256kbps AAC (High Quality)',
+  });
+  assert.deepEqual(resolveAdaptiveBitrate('cellular', true), {
+    bitrateKbps: 64,
+    musicKitConst: 'STANDARD',
+    label: '64kbps HE-AAC (Cellular Saver)',
+  });
+  assert.deepEqual(resolveAdaptiveBitrate('cellular', false), {
+    bitrateKbps: 256,
+    musicKitConst: 'HIGH',
+    label: '256kbps AAC (High Quality)',
+  });
+});
+

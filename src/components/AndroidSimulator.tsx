@@ -34,7 +34,9 @@ import {
   Sliders,
   Disc,
   Flame,
-  ArrowRight
+  ArrowRight,
+  Share2,
+  Timer
 } from 'lucide-react';
 import {
   formatBytes,
@@ -43,7 +45,12 @@ import {
   IPAD_USER_AGENT,
   AppTheme,
   resolveEffectiveTheme,
-  getSystemBarAppearance
+  getSystemBarAppearance,
+  SoundProfileId,
+  SOUND_PROFILE_PRESETS,
+  resolveEqPresetBands,
+  NetworkTransportType,
+  resolveAdaptiveBitrate
 } from '../utils/musicBetaCore';
 
 interface Track {
@@ -181,6 +188,17 @@ export const AndroidSimulator: React.FC = () => {
   const [selectedUA, setSelectedUA] = useState<'iphone' | 'ipad'>('iphone');
   const [cacheUsedBytes, setCacheUsedBytes] = useState(248 * 1024 * 1024);
   const [currentTimeString, setCurrentTimeString] = useState('12:15');
+
+  // New Audiophile & Power-User APK States
+  const [selectedSoundProfile, setSelectedSoundProfile] = useState<SoundProfileId>('apple_studio');
+  const [crossfadeSeconds, setCrossfadeSeconds] = useState<number>(4);
+  const [audioSinkMode, setAudioSinkMode] = useState<'usb_dac' | 'bluetooth' | 'speaker'>('usb_dac');
+  const [sleepTimerMinutes, setSleepTimerMinutes] = useState<number>(0);
+  const [networkTransport, setNetworkTransport] = useState<NetworkTransportType>('wifi');
+  const [cellularDataSaver, setCellularDataSaver] = useState<boolean>(true);
+  const [lyricsKeepAwake, setLyricsKeepAwake] = useState<boolean>(true);
+  const [statusFeedback, setStatusFeedback] = useState<string | null>(null);
+  const [touchStartX, setTouchStartX] = useState<number | null>(null);
 
   const [simTheme, setSimTheme] = useState<AppTheme>(() => {
     try {
@@ -320,6 +338,24 @@ export const AndroidSimulator: React.FC = () => {
     return () => clearInterval(interval);
   }, [isPlaying, currentTrack.duration]);
 
+  const triggerStatusFeedback = (msg: string) => {
+    setStatusFeedback(msg);
+    setTimeout(() => {
+      setStatusFeedback((prev) => (prev === msg ? null : prev));
+    }, 2600);
+  };
+
+  const activeEqPreset = SOUND_PROFILE_PRESETS[selectedSoundProfile];
+  const activeEqBands = resolveEqPresetBands(selectedSoundProfile);
+  const adaptiveBitrateInfo = resolveAdaptiveBitrate(networkTransport, cellularDataSaver);
+
+  const outputSinkLabel =
+    audioSinkMode === 'usb_dac'
+      ? 'USB-C DAC • Bit-Perfect 44.1kHz Float'
+      : audioSinkMode === 'bluetooth'
+      ? `Bluetooth A2DP • ${adaptiveBitrateInfo.bitrateKbps}kbps AAC`
+      : 'Speaker • Session 0 DSP';
+
   const handlePlayPause = () => setIsPlaying(!isPlaying);
   const handleNext = () => {
     setCurrentTrackIndex((prev) => (prev + 1) % SAMPLE_TRACKS.length);
@@ -336,6 +372,31 @@ export const AndroidSimulator: React.FC = () => {
 
   const handleClearCache = () => {
     setCacheUsedBytes(45 * 1024 * 1024);
+  };
+
+  const handleMiniPlayerTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length === 1) {
+      setTouchStartX(e.touches[0].clientX);
+    }
+  };
+
+  const handleMiniPlayerTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (touchStartX === null || e.changedTouches.length === 0) return;
+    const deltaX = e.changedTouches[0].clientX - touchStartX;
+    setTouchStartX(null);
+    if (Math.abs(deltaX) > 42) {
+      if (deltaX < 0) {
+        handleNext();
+        triggerStatusFeedback('Haptic Swipe Left → Next Track');
+      } else {
+        handlePrev();
+        triggerStatusFeedback('Haptic Swipe Right → Previous Track');
+      }
+    }
+  };
+
+  const handleShareSong = () => {
+    triggerStatusFeedback(`Intent.ACTION_SEND → https://music.apple.com/song/${currentTrack.id}`);
   };
 
   return (
@@ -384,6 +445,13 @@ export const AndroidSimulator: React.FC = () => {
               </div>
             </div>
 
+            {/* Live Native Action Toast (Haptics / EQ / Seek / Share) */}
+            {statusFeedback && (
+              <div className="absolute top-12 left-1/2 -translate-x-1/2 z-50 bg-emerald-600/95 text-white text-[10px] font-bold px-3 py-1 rounded-full shadow-lg border border-white/20 pointer-events-none whitespace-nowrap">
+                {statusFeedback}
+              </div>
+            )}
+
             {/* Visual Safe Area & Notch Inset Boundary Guide */}
             {showNotchGuide && (
               <div className="absolute top-0 inset-x-0 h-11 pointer-events-none z-50 border-b-2 border-dashed border-rose-500 bg-rose-500/10 flex items-end justify-between px-3 pb-0.5">
@@ -415,14 +483,14 @@ export const AndroidSimulator: React.FC = () => {
                 <div className="flex items-center justify-between text-xs mb-2">
                   <div className="flex items-center space-x-1.5">
                     <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
-                    <span className="font-semibold text-rose-500">MediaPlaybackService (Foreground)</span>
+                    <span className="font-semibold text-rose-500">MediaPlaybackService (600x600 Art)</span>
                   </div>
                   <span className={`text-[10px] font-mono ${isLight ? 'text-neutral-500' : 'text-white/50'}`}>
-                    NotificationCompat.MediaStyle
+                    ACTION_SEEK_TO
                   </span>
                 </div>
 
-                {/* Android 14 Media Card */}
+                {/* Android 14 Media Card with Interactive Seekbar Scrubbing */}
                 <div
                   className={`rounded-2xl p-3.5 border shadow-lg ${
                     isLight
@@ -439,17 +507,24 @@ export const AndroidSimulator: React.FC = () => {
                     <div className="flex-1 min-w-0">
                       <h4 className="text-sm font-bold truncate">{currentTrack.title}</h4>
                       <p className={`text-xs truncate ${isLight ? 'text-neutral-600' : 'text-white/60'}`}>
-                        {currentTrack.artist} — Apple Music
+                        {currentTrack.artist} — {activeEqPreset.name}
                       </p>
 
-                      {/* Scrubber in notification */}
+                      {/* Interactive Seekbar Scrubber in Notification */}
                       <div className="mt-2 flex items-center space-x-2">
-                        <div className={`flex-1 h-1 rounded-full overflow-hidden ${isLight ? 'bg-neutral-200' : 'bg-white/20'}`}>
-                          <div
-                            className="h-full bg-rose-500 rounded-full transition-all duration-300"
-                            style={{ width: `${(currentTime / currentTrack.duration) * 100}%` }}
-                          />
-                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={currentTrack.duration}
+                          value={currentTime}
+                          aria-label="Lock Screen Seekbar Scrubber"
+                          onChange={(e) => {
+                            const nextSec = Number(e.target.value);
+                            setCurrentTime(nextSec);
+                            triggerStatusFeedback(`MediaSession.onSeekTo(${nextSec * 1000}ms)`);
+                          }}
+                          className="flex-1 h-1.5 accent-rose-500 cursor-pointer"
+                        />
                         <span className={`text-[10px] font-mono ${isLight ? 'text-neutral-500' : 'text-white/50'}`}>
                           {formatDuration(currentTime)} / {formatDuration(currentTrack.duration)}
                         </span>
@@ -988,9 +1063,12 @@ export const AndroidSimulator: React.FC = () => {
                   )}
                 </div>
 
-                {/* Persistent iOS Style Mini Player */}
+                {/* Persistent iOS Style Mini Player (Supports Horizontal Swipe Left/Right + Native Haptics + Universal Share) */}
                 <div
-                  className={`mx-3 mb-2 p-2.5 rounded-2xl backdrop-blur-md border shadow-xl flex items-center space-x-3 transition-colors ${
+                  onTouchStart={handleMiniPlayerTouchStart}
+                  onTouchEnd={handleMiniPlayerTouchEnd}
+                  title="Swipe Left for Next Track / Swipe Right for Previous Track (Triggers Native Haptic Feedback)"
+                  className={`mx-3 mb-2 p-2.5 rounded-2xl backdrop-blur-md border shadow-xl flex items-center space-x-3 transition-colors select-none ${
                     isLight
                       ? 'bg-neutral-100/95 border-neutral-200 text-neutral-900'
                       : 'bg-neutral-900/90 border-white/10 text-white'
@@ -1002,7 +1080,12 @@ export const AndroidSimulator: React.FC = () => {
                     className="w-10 h-10 rounded-xl object-cover shadow-sm"
                   />
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs font-bold truncate">{currentTrack.title}</p>
+                    <div className="flex items-center space-x-1.5">
+                      <p className="text-xs font-bold truncate">{currentTrack.title}</p>
+                      <span className="text-[8px] font-mono px-1 py-0.2 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 shrink-0">
+                        SWIPE
+                      </span>
+                    </div>
                     <p className={`text-[10px] truncate ${isLight ? 'text-neutral-500' : 'text-neutral-400'}`}>
                       {currentTrack.artist}
                     </p>
@@ -1015,183 +1098,408 @@ export const AndroidSimulator: React.FC = () => {
                     </div>
                   </div>
 
-                  <div className="flex items-center space-x-1">
-                    <button
-                      onClick={handlePlayPause}
-                      className={`p-2 transition ${isLight ? 'text-neutral-800 hover:text-rose-500' : 'text-white hover:text-rose-400'}`}
-                      aria-label={isPlaying ? 'Pause' : 'Play'}
-                    >
-                      {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
-                    </button>
-                    <button
-                      onClick={handleNext}
-                      className={`p-2 transition ${isLight ? 'text-neutral-500 hover:text-black' : 'text-neutral-400 hover:text-white'}`}
-                      aria-label="Next"
-                    >
-                      <SkipForward className="w-4 h-4 fill-current" />
-                    </button>
-                  </div>
-                </div>
-
-                {/* Bottom Navigation Bar */}
-                <div
-                  className={`w-full px-4 py-2 border-t flex items-center justify-around text-[10px] transition-colors ${
-                    isLight
-                      ? 'bg-neutral-50 border-neutral-200 text-neutral-500'
-                      : 'bg-black/90 border-white/10 text-neutral-400'
-                  }`}
-                >
+                  <div className="flex items-center space-x-0.5">
                   <button
-                    onClick={() => navigateTo('listen')}
-                    className={`flex flex-col items-center space-y-0.5 ${activeTab === 'listen' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                    onClick={() => {
+                      handlePrev();
+                      triggerStatusFeedback('Haptic Swipe Right → Previous Track');
+                    }}
+                    className={`p-1.5 transition ${isLight ? 'text-neutral-500 hover:text-black' : 'text-neutral-400 hover:text-white'}`}
+                    aria-label="Previous (Swipe Right)"
+                    title="Simulate Swipe Right (Previous Track + Haptic)"
                   >
-                    <Play className="w-4 h-4 fill-current" />
-                    <span>Listen Now</span>
+                    <SkipBack className="w-3.5 h-3.5 fill-current" />
                   </button>
                   <button
-                    onClick={() => navigateTo('browse')}
-                    className={`flex flex-col items-center space-y-0.5 ${activeTab === 'browse' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                    onClick={handlePlayPause}
+                    className={`p-1.5 transition ${isLight ? 'text-neutral-800 hover:text-rose-500' : 'text-white hover:text-rose-400'}`}
+                    aria-label={isPlaying ? 'Pause' : 'Play'}
                   >
-                    <Compass className="w-4 h-4" />
-                    <span>Browse</span>
+                    {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
                   </button>
                   <button
-                    onClick={() => navigateTo('radio')}
-                    className={`flex flex-col items-center space-y-0.5 ${activeTab === 'radio' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                    onClick={() => {
+                      handleNext();
+                      triggerStatusFeedback('Haptic Swipe Left → Next Track');
+                    }}
+                    className={`p-1.5 transition ${isLight ? 'text-neutral-500 hover:text-black' : 'text-neutral-400 hover:text-white'}`}
+                    aria-label="Next"
+                    title="Simulate Swipe Left (Next Track + Haptic)"
                   >
-                    <Radio className="w-4 h-4" />
-                    <span>Radio</span>
+                    <SkipForward className="w-3.5 h-3.5 fill-current" />
                   </button>
                   <button
-                    onClick={() => navigateTo('library')}
-                    className={`flex flex-col items-center space-y-0.5 ${activeTab === 'library' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                    onClick={handleShareSong}
+                    className={`p-1.5 transition ${isLight ? 'text-neutral-500 hover:text-rose-600' : 'text-neutral-400 hover:text-rose-400'}`}
+                    aria-label="Share Universal Song Link"
+                    title="Android Share Sheet (Intent.ACTION_SEND)"
                   >
-                    <Library className="w-4 h-4" />
-                    <span>Library</span>
-                  </button>
-                  <button
-                    onClick={() => navigateTo('search')}
-                    className={`flex flex-col items-center space-y-0.5 ${activeTab === 'search' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
-                  >
-                    <Search className="w-4 h-4" />
-                    <span>Search</span>
+                    <Share2 className="w-3.5 h-3.5" />
                   </button>
                 </div>
               </div>
-            )}
 
-            {/* Android 14 Transparent Navigation Bar Pill (Interactive Back Gesture) */}
-            <div
-              onClick={canGoBack ? handleGoBack : undefined}
-              title={canGoBack ? 'Android Back Gesture: Tap to navigate back in history without losing data' : 'Android Navigation Bar'}
-              className={`w-full h-4 bg-transparent flex items-center justify-center ${canGoBack ? 'cursor-pointer hover:opacity-80' : ''}`}
-            >
-              <div className={`w-28 h-1 rounded-full transition-all ${
-                canGoBack
-                  ? isLight ? 'bg-rose-500/80 hover:h-1.5' : 'bg-rose-500/80 hover:h-1.5'
-                  : isLight ? 'bg-black/40' : 'bg-white/40'
-              }`}></div>
+              {/* Bottom Navigation Bar */}
+              <div
+                className={`w-full px-4 py-2 border-t flex items-center justify-around text-[10px] transition-colors ${
+                  isLight
+                    ? 'bg-neutral-50 border-neutral-200 text-neutral-500'
+                    : 'bg-black/90 border-white/10 text-neutral-400'
+                }`}
+              >
+                <button
+                  onClick={() => navigateTo('listen')}
+                  className={`flex flex-col items-center space-y-0.5 ${activeTab === 'listen' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                >
+                  <Play className="w-4 h-4 fill-current" />
+                  <span>Listen Now</span>
+                </button>
+                <button
+                  onClick={() => navigateTo('browse')}
+                  className={`flex flex-col items-center space-y-0.5 ${activeTab === 'browse' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                >
+                  <Compass className="w-4 h-4" />
+                  <span>Browse</span>
+                </button>
+                <button
+                  onClick={() => navigateTo('radio')}
+                  className={`flex flex-col items-center space-y-0.5 ${activeTab === 'radio' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                >
+                  <Radio className="w-4 h-4" />
+                  <span>Radio</span>
+                </button>
+                <button
+                  onClick={() => navigateTo('library')}
+                  className={`flex flex-col items-center space-y-0.5 ${activeTab === 'library' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                >
+                  <Library className="w-4 h-4" />
+                  <span>Library</span>
+                </button>
+                <button
+                  onClick={() => navigateTo('search')}
+                  className={`flex flex-col items-center space-y-0.5 ${activeTab === 'search' ? 'text-rose-500' : isLight ? 'hover:text-black' : 'hover:text-white'}`}
+                >
+                  <Search className="w-4 h-4" />
+                  <span>Search</span>
+                </button>
+              </div>
             </div>
+          )}
 
-          </div>
-        </div>
-
-        {/* Simulator Hardware Action Controls */}
-        <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
-          {/* Theme Quick Switcher for Simulator */}
-          <div className="inline-flex rounded-lg bg-neutral-900 border border-neutral-700 p-0.5">
-            <button
-              onClick={() => setSimTheme('dark')}
-              className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-xs font-medium transition ${
-                simTheme === 'dark' ? 'bg-rose-500 text-white' : 'text-neutral-400 hover:text-white'
-              }`}
-            >
-              <Moon className="w-3 h-3" />
-              <span>Dark</span>
-            </button>
-            <button
-              onClick={() => setSimTheme('light')}
-              className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-xs font-medium transition ${
-                simTheme === 'light' ? 'bg-rose-500 text-white' : 'text-neutral-400 hover:text-white'
-              }`}
-            >
-              <Sun className="w-3 h-3" />
-              <span>Light</span>
-            </button>
-            <button
-              onClick={() => setSimTheme('system')}
-              className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-xs font-medium transition ${
-                simTheme === 'system' ? 'bg-rose-500 text-white' : 'text-neutral-400 hover:text-white'
-              }`}
-            >
-              <Laptop className="w-3 h-3" />
-              <span>System</span>
-            </button>
+          {/* Android 14 Transparent Navigation Bar Pill (Interactive Back Gesture) */}
+          <div
+            onClick={canGoBack ? handleGoBack : undefined}
+            title={canGoBack ? 'Android Back Gesture: Tap to navigate back in history without losing data' : 'Android Navigation Bar'}
+            className={`w-full h-4 bg-transparent flex items-center justify-center ${canGoBack ? 'cursor-pointer hover:opacity-80' : ''}`}
+          >
+            <div className={`w-28 h-1 rounded-full transition-all ${
+              canGoBack
+                ? isLight ? 'bg-rose-500/80 hover:h-1.5' : 'bg-rose-500/80 hover:h-1.5'
+                : isLight ? 'bg-black/40' : 'bg-white/40'
+            }`}></div>
           </div>
 
-          <button
-            onClick={() => setScreenOff(!screenOff)}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
-              screenOff
-                ? 'bg-rose-500 text-white border-rose-400'
-                : 'bg-neutral-900 text-neutral-300 border-neutral-700 hover:border-neutral-500'
-            }`}
-          >
-            {screenOff ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-            <span>{screenOff ? 'Wake Screen' : 'Screen-Off'}</span>
-          </button>
-
-          <button
-            onClick={() => setNotificationOpen(!notificationOpen)}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
-              notificationOpen
-                ? 'bg-amber-500 text-black border-amber-400'
-                : 'bg-neutral-900 text-neutral-300 border-neutral-700 hover:border-neutral-500'
-            }`}
-          >
-            <Bell className="w-3.5 h-3.5" />
-            <span>{notificationOpen ? 'Hide Shade' : 'Media Shade'}</span>
-          </button>
-
-          {/* Safe Area & Notch Simulator Toggles */}
-          <button
-            onClick={() => setSafeAreaProtected(!safeAreaProtected)}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
-              safeAreaProtected
-                ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40 hover:bg-emerald-500/25'
-                : 'bg-rose-500 text-white border-rose-400 animate-pulse'
-            }`}
-            title="Toggle Safe Area Inset Protection to simulate or resolve status bar & notch overlap"
-          >
-            <Shield className="w-3.5 h-3.5" />
-            <span>{safeAreaProtected ? 'Safe Area: Protected' : 'Defect: Notch Overlap'}</span>
-          </button>
-
-          <button
-            onClick={() => setShowNotchGuide(!showNotchGuide)}
-            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition ${
-              showNotchGuide
-                ? 'bg-cyan-500/20 text-cyan-400 border-cyan-400'
-                : 'bg-neutral-900 text-neutral-400 border-neutral-700 hover:text-white'
-            }`}
-            title="Show safe area and camera punch-hole boundary guides"
-          >
-            <span>{showNotchGuide ? 'Hide Guides' : 'Notch Guides'}</span>
-          </button>
-
-          <button
-            onClick={handleResetSimulatorState}
-            title="Clear saved draft and reset navigation back stack"
-            className="flex items-center space-x-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-neutral-700 bg-neutral-900 text-neutral-400 hover:text-white hover:border-neutral-500 transition"
-          >
-            <RotateCcw className="w-3 h-3" />
-            <span>Reset State</span>
-          </button>
         </div>
       </div>
 
-      {/* Right Column: Hardware Performance & Core Requirements Telemetry Panel */}
-      <div className="lg:col-span-6 space-y-4">
+      {/* Simulator Hardware Action Controls */}
+      <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+        {/* Theme Quick Switcher for Simulator */}
+        <div className="inline-flex rounded-lg bg-neutral-900 border border-neutral-700 p-0.5">
+          <button
+            onClick={() => setSimTheme('dark')}
+            className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-xs font-medium transition ${
+              simTheme === 'dark' ? 'bg-rose-500 text-white' : 'text-neutral-400 hover:text-white'
+            }`}
+          >
+            <Moon className="w-3 h-3" />
+            <span>Dark</span>
+          </button>
+          <button
+            onClick={() => setSimTheme('light')}
+            className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-xs font-medium transition ${
+              simTheme === 'light' ? 'bg-rose-500 text-white' : 'text-neutral-400 hover:text-white'
+            }`}
+          >
+            <Sun className="w-3 h-3" />
+            <span>Light</span>
+          </button>
+          <button
+            onClick={() => setSimTheme('system')}
+            className={`flex items-center space-x-1 px-2.5 py-1 rounded-md text-xs font-medium transition ${
+              simTheme === 'system' ? 'bg-rose-500 text-white' : 'text-neutral-400 hover:text-white'
+            }`}
+          >
+            <Laptop className="w-3 h-3" />
+            <span>System</span>
+          </button>
+        </div>
+
+        <button
+          onClick={() => setScreenOff(!screenOff)}
+          className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
+            screenOff
+              ? 'bg-rose-500 text-white border-rose-400'
+              : 'bg-neutral-900 text-neutral-300 border-neutral-700 hover:border-neutral-500'
+          }`}
+        >
+          {screenOff ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+          <span>{screenOff ? 'Wake Screen' : 'Screen-Off'}</span>
+        </button>
+
+        <button
+          onClick={() => setNotificationOpen(!notificationOpen)}
+          className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
+            notificationOpen
+              ? 'bg-amber-500 text-black border-amber-400'
+              : 'bg-neutral-900 text-neutral-300 border-neutral-700 hover:border-neutral-500'
+          }`}
+        >
+          <Bell className="w-3.5 h-3.5" />
+          <span>{notificationOpen ? 'Hide Shade' : 'Media Shade'}</span>
+        </button>
+
+        {/* Safe Area & Notch Simulator Toggles */}
+        <button
+          onClick={() => setSafeAreaProtected(!safeAreaProtected)}
+          className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
+            safeAreaProtected
+              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40 hover:bg-emerald-500/25'
+              : 'bg-rose-500 text-white border-rose-400 animate-pulse'
+          }`}
+          title="Toggle Safe Area Inset Protection to simulate or resolve status bar & notch overlap"
+        >
+          <Shield className="w-3.5 h-3.5" />
+          <span>{safeAreaProtected ? 'Safe Area: Protected' : 'Defect: Notch Overlap'}</span>
+        </button>
+
+        <button
+          onClick={() => setShowNotchGuide(!showNotchGuide)}
+          className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition ${
+            showNotchGuide
+              ? 'bg-cyan-500/20 text-cyan-400 border-cyan-400'
+              : 'bg-neutral-900 text-neutral-400 border-neutral-700 hover:text-white'
+          }`}
+          title="Show safe area and camera punch-hole boundary guides"
+        >
+          <span>{showNotchGuide ? 'Hide Guides' : 'Notch Guides'}</span>
+        </button>
+
+        <button
+          onClick={handleResetSimulatorState}
+          title="Clear saved draft and reset navigation back stack"
+          className="flex items-center space-x-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-neutral-700 bg-neutral-900 text-neutral-400 hover:text-white hover:border-neutral-500 transition"
+        >
+          <RotateCcw className="w-3 h-3" />
+          <span>Reset State</span>
+        </button>
+      </div>
+    </div>
+
+    {/* Right Column: Hardware Performance & Core Requirements Telemetry Panel */}
+    <div className="lg:col-span-6 space-y-4">
+      {/* Audiophile 5-Band EQ, Crossfade, Sleep Timer & Adaptive Bitrate Suite */}
+      <div className="p-4 rounded-2xl bg-neutral-900/90 border border-rose-500/30 shadow-lg bg-gradient-to-br from-rose-950/25 via-neutral-900 to-neutral-950">
+        <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div className="flex items-center space-x-2.5">
+            <div className="p-2 rounded-xl bg-rose-500/15 text-rose-400 border border-rose-500/30">
+              <Sliders className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center space-x-2">
+                <span>Apple Signature DSP &amp; Power-User Suite</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold">
+                  SESSION 0 MASTERING
+                </span>
+              </h3>
+              <p className="text-xs text-neutral-400">
+                Live 5-Band <code className="text-rose-400">DynamicsProcessing</code>, Gapless Crossfade, Output Sink HUD &amp; Adaptive Bitrate
+              </p>
+            </div>
+          </div>
+          <span className="text-[10px] font-mono px-2 py-1 rounded-lg bg-neutral-950 border border-neutral-800 text-emerald-400">
+            {outputSinkLabel}
+          </span>
+        </div>
+
+        {/* Sound Profile Preset Selector */}
+        <div className="mb-3">
+          <div className="flex items-center justify-between text-[11px] text-neutral-400 mb-1.5">
+            <span className="font-semibold text-neutral-300">5-Band Mastering Preset ({activeEqPreset.name})</span>
+            <span className="font-mono text-[10px] text-rose-400">Preamp: {activeEqPreset.preampDb >= 0 ? `+${activeEqPreset.preampDb.toFixed(1)}` : activeEqPreset.preampDb.toFixed(1)} dB</span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+            {Object.values(SOUND_PROFILE_PRESETS).map((preset) => (
+              <button
+                key={preset.id}
+                onClick={() => {
+                  setSelectedSoundProfile(preset.id);
+                  triggerStatusFeedback(`Applied ${preset.name} to Session 0 DynamicsProcessing`);
+                }}
+                className={`px-2 py-1.5 rounded-lg text-[11px] font-medium border text-center transition ${
+                  selectedSoundProfile === preset.id
+                    ? 'bg-rose-500 text-white border-rose-400 shadow-sm'
+                    : 'bg-neutral-950/80 text-neutral-400 border-neutral-800 hover:text-white hover:border-neutral-700'
+                }`}
+              >
+                {preset.name.replace('Apple Signature ', '').replace(' / Reference', '')}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 5-Band Gain Visualizer */}
+        <div className="grid grid-cols-5 gap-1.5 mb-3 p-2.5 rounded-xl bg-neutral-950/80 border border-neutral-800/90">
+          {[
+            { freq: '80Hz Sub', val: activeEqBands[0]?.netGainDb ?? 0 },
+            { freq: '250Hz Mud', val: activeEqBands[1]?.netGainDb ?? 0 },
+            { freq: '1kHz Mid', val: activeEqBands[2]?.netGainDb ?? 0 },
+            { freq: '3.5kHz Vocal', val: activeEqBands[3]?.netGainDb ?? 0 },
+            { freq: '12kHz+ Air', val: activeEqBands[4]?.netGainDb ?? 0 },
+          ].map((band) => (
+            <div key={band.freq} className="text-center">
+              <span className="block text-[9px] font-mono text-neutral-500">{band.freq}</span>
+              <span className={`block text-xs font-mono font-bold mt-0.5 ${band.val > 0 ? 'text-emerald-400' : band.val < 0 ? 'text-amber-400' : 'text-neutral-300'}`}>
+                {band.val > 0 ? `+${band.val.toFixed(1)}` : band.val.toFixed(1)} dB
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* Interactive Controls Grid: Crossfade, Output Sink, Sleep Timer, Network Bitrate, Lyrics Keep-Awake */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+          {/* Crossfade Slider */}
+          <div className="p-2.5 rounded-xl bg-neutral-950/70 border border-neutral-800">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[11px] text-neutral-300 font-medium">Gapless &amp; Crossfade</span>
+              <span className="font-mono text-[11px] text-rose-400 font-bold">
+                {crossfadeSeconds === 0 ? 'Gapless (0s)' : `${crossfadeSeconds}s Overlap`}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={12}
+              value={crossfadeSeconds}
+              aria-label="Crossfade Duration Seconds"
+              onChange={(e) => {
+                const sec = Number(e.target.value);
+                setCrossfadeSeconds(sec);
+                triggerStatusFeedback(sec === 0 ? 'Gapless Playback Active (0s)' : `Crossfade set to ${sec}s in Web Audio`);
+              }}
+              className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-rose-500"
+            />
+          </div>
+
+          {/* Hardware Output Sink Selector */}
+          <div className="p-2.5 rounded-xl bg-neutral-950/70 border border-neutral-800">
+            <span className="text-[11px] text-neutral-300 font-medium block mb-1">Active Audio Output Sink</span>
+            <div className="grid grid-cols-3 gap-1">
+              {[
+                { id: 'usb_dac' as const, label: 'USB DAC 32f' },
+                { id: 'bluetooth' as const, label: 'BT A2DP' },
+                { id: 'speaker' as const, label: 'Speaker' },
+              ].map((sink) => (
+                <button
+                  key={sink.id}
+                  onClick={() => {
+                    setAudioSinkMode(sink.id);
+                    triggerStatusFeedback(`Audio Sink switched to ${sink.label}`);
+                  }}
+                  className={`px-1.5 py-1 rounded text-[10px] font-mono border transition ${
+                    audioSinkMode === sink.id
+                      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 font-bold'
+                      : 'bg-neutral-900 text-neutral-400 border-neutral-800 hover:text-white'
+                  }`}
+                >
+                  {sink.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Smart Sleep Timer with 10s Gentle Fade-Out */}
+          <div className="p-2.5 rounded-xl bg-neutral-950/70 border border-neutral-800">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-[11px] text-neutral-300 font-medium flex items-center space-x-1">
+                <Timer className="w-3.5 h-3.5 text-amber-400" />
+                <span>Sleep Timer (10s Fade)</span>
+              </span>
+              <span className="font-mono text-[10px] text-amber-400">
+                {sleepTimerMinutes ? `${sleepTimerMinutes}m Active` : 'Off'}
+              </span>
+            </div>
+            <div className="flex items-center space-x-1">
+              {[0, 15, 30, 60].map((mins) => (
+                <button
+                  key={String(mins)}
+                  onClick={() => {
+                    setSleepTimerMinutes(mins);
+                    triggerStatusFeedback(mins ? `Sleep Timer: ${mins}m (with 10s gentle fade-out)` : 'Sleep Timer cancelled');
+                  }}
+                  className={`flex-1 py-1 rounded text-[10px] font-mono border transition ${
+                    sleepTimerMinutes === mins
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                      : 'bg-neutral-900 text-neutral-400 border-neutral-800 hover:text-white'
+                  }`}
+                >
+                  {mins === 0 ? 'Off' : `${mins}m`}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Adaptive Network Bitrate & Lyrics Keep-Awake */}
+          <div className="p-2.5 rounded-xl bg-neutral-950/70 border border-neutral-800 flex flex-col justify-between">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-neutral-300 font-medium">Adaptive Bitrate</span>
+              <span className="font-mono text-[10px] text-cyan-400 font-bold">
+                {adaptiveBitrateInfo.bitrateKbps}kbps ({adaptiveBitrateInfo.musicKitConst})
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-1 mt-1.5">
+              <button
+                onClick={() => {
+                  const next = networkTransport === 'wifi' ? 'cellular' : 'wifi';
+                  setNetworkTransport(next);
+                  triggerStatusFeedback(`Network: ${next.toUpperCase()} (${next === 'cellular' && cellularDataSaver ? '64kbps Data Saver' : '256kbps High'})`);
+                }}
+                className="px-2 py-1 rounded text-[10px] font-mono bg-neutral-900 border border-neutral-700 text-neutral-200 hover:border-cyan-500/50"
+              >
+                Net: {networkTransport.toUpperCase()}
+              </button>
+              <button
+                onClick={() => {
+                  setCellularDataSaver(!cellularDataSaver);
+                  triggerStatusFeedback(`Cellular Data Saver: ${!cellularDataSaver ? 'ON (64kbps HE-AAC)' : 'OFF (256kbps AAC)'}`);
+                }}
+                className={`px-2 py-1 rounded text-[10px] font-mono border ${
+                  cellularDataSaver
+                    ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                    : 'bg-neutral-900 text-neutral-400 border-neutral-800'
+                }`}
+              >
+                Saver: {cellularDataSaver ? 'ON' : 'OFF'}
+              </button>
+              <button
+                onClick={() => {
+                  setLyricsKeepAwake(!lyricsKeepAwake);
+                  triggerStatusFeedback(`Lyrics Keep-Awake (FLAG_KEEP_SCREEN_ON): ${!lyricsKeepAwake ? 'ENABLED' : 'OFF'}`);
+                }}
+                className={`px-2 py-1 rounded text-[10px] font-mono border ${
+                  lyricsKeepAwake
+                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                    : 'bg-neutral-900 text-neutral-400 border-neutral-800'
+                }`}
+                title="Toggle FLAG_KEEP_SCREEN_ON when live lyrics are visible"
+              >
+                Lyrics Awake
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
         {/* Navigation State Preservation Monitor */}
         <div className="p-4 rounded-2xl bg-neutral-900/80 border border-emerald-500/30 shadow-md bg-gradient-to-br from-emerald-950/20 to-neutral-900">
           <div className="flex items-start justify-between">

@@ -33,8 +33,9 @@ import java.net.URL
  *
  * Fulfills:
  * - Ongoing ForegroundService with MediaSessionCompat media notification
+ * - High-Resolution 600x600 Lock-Screen Album Art & Interactive Seekbar Scrubbing (ACTION_SEEK_TO)
  * - PowerManager.PARTIAL_WAKE_LOCK & WifiManager Wi-Fi Lock during playback
- * - Handles Media Key events (Play, Pause, Next, Prev) via MediaSession callbacks
+ * - Handles Media Key events (Play, Pause, Next, Prev, SeekTo) via MediaSession callbacks
  * - Android 14+ (API 34) Foreground Service Type: mediaPlayback
  */
 class MediaPlaybackService : Service() {
@@ -53,6 +54,8 @@ class MediaPlaybackService : Service() {
         const val EXTRA_TITLE = "extra_title"
         const val EXTRA_ARTIST = "extra_artist"
         const val EXTRA_ARTWORK_URL = "extra_artwork_url"
+        const val EXTRA_POSITION_MS = "extra_position_ms"
+        const val EXTRA_DURATION_MS = "extra_duration_ms"
 
         // Notification Action Intents
         const val ACTION_NOTIFICATION_PLAY = "com.musicbeta.wrapper.NOTIFICATION_PLAY"
@@ -75,6 +78,8 @@ class MediaPlaybackService : Service() {
     private var currentArtist: String = "Playing in Background"
     private var currentArtworkUrl: String = ""
     private var currentArtworkBitmap: Bitmap? = null
+    private var currentPositionMs: Long = PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN
+    private var currentDurationMs: Long = 0L
     private var isPlaying: Boolean = false
 
     override fun onCreate() {
@@ -177,6 +182,12 @@ class MediaPlaybackService : Service() {
                     handlePreviousCommand()
                 }
 
+                override fun onSeekTo(pos: Long) {
+                    currentPositionMs = pos
+                    updatePlaybackState(isPlaying)
+                    dispatchSeekToActivity(pos)
+                }
+
                 override fun onStop() {
                     handleStopCommand()
                 }
@@ -193,12 +204,13 @@ class MediaPlaybackService : Service() {
                 PlaybackStateCompat.ACTION_PLAY_PAUSE or
                 PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
                 PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                PlaybackStateCompat.ACTION_SEEK_TO or
                 PlaybackStateCompat.ACTION_STOP
 
         mediaSession.setPlaybackState(
             PlaybackStateCompat.Builder()
                 .setActions(actions)
-                .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+                .setState(state, currentPositionMs, 1.0f)
                 .build()
         )
     }
@@ -208,6 +220,10 @@ class MediaPlaybackService : Service() {
             .putString(MediaMetadataCompat.METADATA_KEY_TITLE, currentTitle)
             .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, currentArtist)
             .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, "Apple Music")
+
+        if (currentDurationMs > 0L) {
+            builder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, currentDurationMs)
+        }
 
         currentArtworkBitmap?.let {
             builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, it)
@@ -223,9 +239,13 @@ class MediaPlaybackService : Service() {
         val title = intent.getStringExtra(EXTRA_TITLE) ?: currentTitle
         val artist = intent.getStringExtra(EXTRA_ARTIST) ?: currentArtist
         val artworkUrl = intent.getStringExtra(EXTRA_ARTWORK_URL) ?: currentArtworkUrl
+        val posMs = intent.getLongExtra(EXTRA_POSITION_MS, -1L)
+        val durMs = intent.getLongExtra(EXTRA_DURATION_MS, -1L)
 
         if (title.isNotEmpty()) currentTitle = title
         if (artist.isNotEmpty()) currentArtist = artist
+        if (posMs >= 0L) currentPositionMs = posMs
+        if (durMs > 0L) currentDurationMs = durMs
 
         when (action) {
             ACTION_START_PLAYBACK, ACTION_NOTIFICATION_PLAY -> {
@@ -258,6 +278,7 @@ class MediaPlaybackService : Service() {
             }
 
             ACTION_UPDATE_METADATA -> {
+                updatePlaybackState(isPlaying)
                 loadArtworkAndRefresh(artworkUrl)
             }
 
@@ -313,11 +334,33 @@ class MediaPlaybackService : Service() {
         sendBroadcast(intent)
     }
 
+    private fun dispatchSeekToActivity(positionMs: Long) {
+        val intent = Intent(MainActivity.ACTION_MEDIA_COMMAND).apply {
+            putExtra(MainActivity.EXTRA_COMMAND, MainActivity.COMMAND_SEEK_TO)
+            putExtra(MainActivity.EXTRA_SEEK_POSITION_MS, positionMs)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
+    }
+
+    /**
+     * Upgrades Apple Music CDN artwork URLs to high-resolution 600x600bb.jpg for crisp Android Lock-Screen
+     * and MediaStyle Notification display.
+     */
+    private fun upgradeArtworkToHighRes(url: String): String {
+        if (url.isBlank()) return url
+        return url.replace(
+            Regex("/\\d{2,4}x\\d{2,4}([a-z]{0,4})\\.(jpg|jpeg|webp|png)", RegexOption.IGNORE_CASE),
+            "/600x600bb.jpg"
+        )
+    }
+
     private fun loadArtworkAndRefresh(url: String) {
-        if (url.isNotEmpty() && url != currentArtworkUrl) {
-            currentArtworkUrl = url
+        val highResUrl = upgradeArtworkToHighRes(url)
+        if (highResUrl.isNotEmpty() && highResUrl != currentArtworkUrl) {
+            currentArtworkUrl = highResUrl
             serviceScope.launch {
-                val bitmap = downloadBitmap(url)
+                val bitmap = downloadBitmap(highResUrl)
                 currentArtworkBitmap = bitmap
                 updateMediaMetadata()
                 refreshNotification()

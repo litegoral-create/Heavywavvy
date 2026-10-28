@@ -19,6 +19,9 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioMixerAttributes
 import android.media.audiofx.DynamicsProcessing
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -26,8 +29,10 @@ import android.os.Looper
 import android.os.Message
 import android.util.Log
 import android.view.Display
+import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.HttpAuthHandler
@@ -77,7 +82,11 @@ import java.io.File
  * 4. SSL, HTTP Auth & Redirect Loop Prevention:
  *    - Preserves Set-Cookie headers across 302 redirects by never calling view.loadUrl() mid-redirect on https:// URLs.
  *    - Guards against infinite redirect loops with a sliding-window timestamp detector and preserves credentials in onReceivedHttpAuthRequest.
- * 5. MusicKit JS High-Bitrate (256kbps AAC), Preconnect Injection & Native Android DynamicsProcessing DSP (Session 0) + Bit-Perfect USB DAC.
+ * 5. Audiophile & Power-User Suite:
+ *    - Native 5-Band EQ Sound Profiles (Apple Studio, Bass Boost, Vocal Clarity, Late Night, Flat Bypass) + Preamp Gain on Session 0.
+ *    - Web Audio / MusicKit Crossfade Engine (0s-12s), High-Res 600x600 Lock-Screen Art & Interactive Seekbar Scrubbing.
+ *    - Mini-Player Swipe Gestures with Native Haptic Feedback, Lyrics Keep-Awake (FLAG_KEEP_SCREEN_ON), Smart Sleep Timer with 10s Fade-Out,
+ *      Cellular Data Saver vs. Wi-Fi Auto-Bitrate Switching, and Universal Song Link Share Sheet Resolver.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -91,12 +100,22 @@ class MainActivity : AppCompatActivity() {
         private const val REDIRECT_LOOP_WINDOW_MS = 8_000L
         private const val MAX_RAPID_REDIRECTS = 4
 
-        // Preferences for Light/Dark Mode
+        // Preferences for Light/Dark Mode, EQ Sound Profile, Crossfade & Data Saver
         private const val PREFS_NAME = "music_wrapper_prefs"
         private const val KEY_THEME_MODE = "pref_theme_mode"
+        private const val KEY_SOUND_PROFILE = "pref_sound_profile"
+        private const val KEY_CROSSFADE_SECONDS = "pref_crossfade_seconds"
+        private const val KEY_CELLULAR_DATA_SAVER = "pref_cellular_data_saver"
         const val THEME_SYSTEM = "system"
         const val THEME_LIGHT = "light"
         const val THEME_DARK = "dark"
+
+        // Native 5-Band EQ Sound Profile IDs
+        const val PROFILE_APPLE_STUDIO = "apple_studio"
+        const val PROFILE_BASS_BOOST = "bass_boost"
+        const val PROFILE_VOCAL_CLARITY = "vocal_clarity"
+        const val PROFILE_LATE_NIGHT = "late_night"
+        const val PROFILE_FLAT_BYPASS = "flat_bypass"
 
         // Clean Widevine-compatible Mobile Chrome User-Agent (strips Android "; wv" token so Apple ID & DRM never reject the WebView)
         const val MOBILE_CHROME_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
@@ -104,10 +123,12 @@ class MainActivity : AppCompatActivity() {
         // Broadcast actions between Activity and MediaPlaybackService
         const val ACTION_MEDIA_COMMAND = "com.musicbeta.wrapper.MEDIA_COMMAND"
         const val EXTRA_COMMAND = "extra_command"
+        const val EXTRA_SEEK_POSITION_MS = "extra_seek_position_ms"
         const val COMMAND_PLAY = "command_play"
         const val COMMAND_PAUSE = "command_pause"
         const val COMMAND_NEXT = "command_next"
         const val COMMAND_PREV = "command_prev"
+        const val COMMAND_SEEK_TO = "command_seek_to"
 
         // Blocked Telemetry & Analytics Domains/Substrings
         private val BLOCKED_TELEMETRY_PATTERNS = listOf(
@@ -186,12 +207,24 @@ class MainActivity : AppCompatActivity() {
     private var currentRefreshRate: Float = 60.0f
     private var isPlayingAudio: Boolean = false
     private var currentThemeMode: String = THEME_SYSTEM
+    private var currentSoundProfile: String = PROFILE_APPLE_STUDIO
+    private var crossfadeSeconds: Int = 4
+    private var isCellularDataSaverEnabled: Boolean = false
     private var lastTopInsetDp: Int = 0
     private var lastBottomInsetDp: Int = 0
     private var lastLeftInsetDp: Int = 0
     private var lastRightInsetDp: Int = 0
 
-    // Broadcast receiver for hardware media keys forwarded by MediaPlaybackService
+    // Smart Sleep Timer with 10-second gentle volume fade-out
+    private val sleepTimerHandler = Handler(Looper.getMainLooper())
+    private var sleepTimerRunnable: Runnable? = null
+    private var sleepTimerRemainingSeconds: Int = 0
+
+    // Adaptive Network Bitrate Callback (Wi-Fi 256kbps vs Cellular 64kbps Data Saver)
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkBitrateCallback: ConnectivityManager.NetworkCallback? = null
+
+    // Broadcast receiver for hardware media keys & lock-screen seekbar scrubbing forwarded by MediaPlaybackService
     private val mediaCommandReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ACTION_MEDIA_COMMAND) {
@@ -200,6 +233,10 @@ class MainActivity : AppCompatActivity() {
                     COMMAND_PAUSE -> executeJavaScript("dispatchMediaAction('pause')")
                     COMMAND_NEXT -> executeJavaScript("dispatchMediaAction('next')")
                     COMMAND_PREV -> executeJavaScript("dispatchMediaAction('previous')")
+                    COMMAND_SEEK_TO -> {
+                        val posMs = intent.getLongExtra(EXTRA_SEEK_POSITION_MS, 0L)
+                        seekToPositionMs(posMs)
+                    }
                 }
             }
         }
@@ -208,6 +245,9 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         currentThemeMode = sharedPreferences.getString(KEY_THEME_MODE, THEME_SYSTEM) ?: THEME_SYSTEM
+        currentSoundProfile = sharedPreferences.getString(KEY_SOUND_PROFILE, PROFILE_APPLE_STUDIO) ?: PROFILE_APPLE_STUDIO
+        crossfadeSeconds = sharedPreferences.getInt(KEY_CROSSFADE_SECONDS, 4)
+        isCellularDataSaverEnabled = sharedPreferences.getBoolean(KEY_CELLULAR_DATA_SAVER, false)
 
         // Apply saved theme before view inflation
         applyAppCompatNightMode(currentThemeMode)
@@ -238,11 +278,15 @@ class MainActivity : AppCompatActivity() {
         // 4. Initialize Native "Apple Signature Sound" DynamicsProcessing DSP (Session 0) & Android 14+ Bit-Perfect USB DAC Engine
         // Guarded by isAudioEngineInitialized and full try/catch (Throwable) blocks so UI re-attachment never duplicates effects
         initSingletonAudioEngineSafely()
+        appleSignatureAudioEngine?.applySoundProfile(currentSoundProfile)
 
-        // 5. Setup Back-press handling to navigate WebView history without reload
+        // 5. Register Adaptive Network Bitrate Monitor (256kbps Wi-Fi vs 64kbps Cellular Data Saver)
+        registerAdaptiveNetworkBitrateCallback()
+
+        // 6. Setup Back-press handling to navigate WebView history without reload
         setupBackNavigation()
 
-        // 6. Register Media Command Receiver
+        // 7. Register Media Command Receiver
         val filter = IntentFilter(ACTION_MEDIA_COMMAND)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(mediaCommandReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -250,18 +294,12 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(mediaCommandReceiver, filter)
         }
 
-        // 7. Zero-Reload Persistence: Only call webView.loadUrl(...) if webView.url == null
-        val incomingUrl = intent?.dataString
-        val targetUrl = if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
-            incomingUrl.replace(
-                Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
-                APPLE_MUSIC_BETA_URL
-            )
-        } else {
-            APPLE_MUSIC_BETA_URL
-        }
-
+        // 8. Zero-Reload Persistence & Share Sheet Universal Song Link Resolution:
+        // Only call webView.loadUrl(...) if webView.url == null or if an explicit deep-link/share intent arrived
+        val targetUrl = resolveIncomingOrSharedUrl(intent)
         if (webView.url == null) {
+            webView.loadUrl(targetUrl)
+        } else if (targetUrl != APPLE_MUSIC_BETA_URL && targetUrl != webView.url) {
             webView.loadUrl(targetUrl)
         } else {
             progressBar.visibility = View.GONE
@@ -1045,17 +1083,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * System #2: MusicKit JS High-Bitrate (256kbps AAC) & Web Audio 32-Bit Float Mastering Injection.
+     * System #2: MusicKit JS High-Bitrate (256kbps AAC), Crossfade Engine & Web Audio 32-Bit Float Mastering Injection.
      * - Sets localStorage['music.ampwebplay.bitrate'] = '256' and polls window.MusicKit to enforce
-     *   music.bitrate = MusicKit.PlaybackBitrate.HIGH (256kbps AAC).
+     *   music.bitrate = MusicKit.PlaybackBitrate.HIGH (256kbps AAC) or adaptive 64kbps when Cellular Data Saver is active.
+     * - Injects configurable gapless/crossfade ramp engine (0s-12s) and Sleep Timer fade multiplier hook.
      * - Safely attempts to attach a 32-bit float Web Audio API mastering chain (65Hz low-shelf +1.8dB warmth,
      *   13.5kHz high-shelf +2.0dB air, soft-knee DynamicsCompressor) to <audio> elements inside a try/catch
      *   so if Widevine EME blocks createMediaElementSource CORS, playback continues uninterrupted via the
      *   native Android DynamicsProcessing engine on Session 0.
      */
     private fun injectAppleSignatureWebAudioScript() {
+        val initialCrossfade = crossfadeSeconds
         val script = """
             (function() {
+                window.__musicBetaCrossfadeSeconds = $initialCrossfade;
+                window.__musicBetaSleepFadeMultiplier = 1.0;
+
                 if (window.__appleSignatureAudioInjected) return;
                 window.__appleSignatureAudioInjected = true;
 
@@ -1063,6 +1106,24 @@ class MainActivity : AppCompatActivity() {
                 try {
                     localStorage.setItem('music.ampwebplay.bitrate', '256');
                 } catch (storageErr) {}
+
+                window.__setMusicKitAdaptiveBitrate = function(targetKbps) {
+                    try {
+                        localStorage.setItem('music.ampwebplay.bitrate', String(targetKbps));
+                        if (window.MusicKit && typeof window.MusicKit.getInstance === 'function') {
+                            var music = window.MusicKit.getInstance();
+                            if (music) {
+                                if (targetKbps >= 256) {
+                                    music.bitrate = (window.MusicKit.PlaybackBitrate && window.MusicKit.PlaybackBitrate.HIGH !== undefined)
+                                        ? window.MusicKit.PlaybackBitrate.HIGH : 256;
+                                } else {
+                                    music.bitrate = (window.MusicKit.PlaybackBitrate && window.MusicKit.PlaybackBitrate.STANDARD !== undefined)
+                                        ? window.MusicKit.PlaybackBitrate.STANDARD : 64;
+                                }
+                            }
+                        }
+                    } catch (_) {}
+                };
 
                 var bitrateAttempts = 0;
                 var bitrateTimer = setInterval(function() {
@@ -1078,7 +1139,11 @@ class MainActivity : AppCompatActivity() {
                                 if (!window.__musicKitBitrateHooked && typeof music.addEventListener === 'function') {
                                     window.__musicKitBitrateHooked = true;
                                     music.addEventListener('playbackStateDidChange', function() {
-                                        try { music.bitrate = highValue; } catch (_) {}
+                                        try {
+                                            if (localStorage.getItem('music.ampwebplay.bitrate') !== '64') {
+                                                music.bitrate = highValue;
+                                            }
+                                        } catch (_) {}
                                     });
                                 }
                                 clearInterval(bitrateTimer);
@@ -1090,11 +1155,42 @@ class MainActivity : AppCompatActivity() {
                     }
                 }, 1000);
 
-                // 2b. Resilient 32-Bit Float Web Audio Mastering Graph (with EME/CORS fallback to Native Session 0 DSP)
+                // 2b. Smooth Crossfade & Sleep Timer Volume Envelope Controller
+                window.__applySleepTimerFade = function(multiplier) {
+                    window.__musicBetaSleepFadeMultiplier = Math.max(0, Math.min(1, multiplier));
+                    var audios = document.querySelectorAll('audio');
+                    for (var i = 0; i < audios.length; i++) {
+                        try {
+                            audios[i].volume = window.__musicBetaSleepFadeMultiplier;
+                        } catch (_) {}
+                    }
+                };
+
+                // 2c. Resilient 32-Bit Float Web Audio Mastering Graph (with EME/CORS fallback to Native Session 0 DSP)
                 var audioCtx = null;
                 function attachWebAudioMastering(audioEl) {
                     if (!audioEl || audioEl.__appleSignatureAttached) return;
                     audioEl.__appleSignatureAttached = true;
+
+                    // Attach smooth crossfade envelope listener on timeupdate
+                    audioEl.addEventListener('timeupdate', function() {
+                        try {
+                            var cfSec = Number(window.__musicBetaCrossfadeSeconds || 0);
+                            var sleepMult = Number(window.__musicBetaSleepFadeMultiplier !== undefined ? window.__musicBetaSleepFadeMultiplier : 1.0);
+                            if (cfSec > 0 && audioEl.duration > cfSec * 2) {
+                                var remaining = audioEl.duration - audioEl.currentTime;
+                                var cfMult = 1.0;
+                                if (remaining > 0 && remaining <= cfSec) {
+                                    cfMult = Math.max(0.15, remaining / cfSec);
+                                } else if (audioEl.currentTime <= cfSec * 0.5) {
+                                    cfMult = Math.min(1.0, 0.35 + (audioEl.currentTime / (cfSec * 0.5)) * 0.65);
+                                }
+                                audioEl.volume = Math.max(0, Math.min(1, cfMult * sleepMult));
+                            } else {
+                                audioEl.volume = Math.max(0, Math.min(1, sleepMult));
+                            }
+                        } catch (_) {}
+                    });
 
                     try {
                         // If Widevine EME MediaKeys are already bound on this element, skip createMediaElementSource
@@ -1159,8 +1255,9 @@ class MainActivity : AppCompatActivity() {
                 if (window.__musicBetaBridgeInjected) return;
                 window.__musicBetaBridgeInjected = true;
                 var lastMetaSignature = '';
+                var lastLyricsVisible = false;
 
-                window.dispatchMediaAction = function(action) {
+                window.dispatchMediaAction = function(action, valueMs) {
                     try {
                         if (action === 'play' || action === 'pause') {
                             const btn = document.querySelector('button[data-testid="play-pause-button"], button[aria-label="Play"], button[aria-label="Pause"], .playback-play-pause-button');
@@ -1171,10 +1268,72 @@ class MainActivity : AppCompatActivity() {
                         } else if (action === 'previous') {
                             const prevBtn = document.querySelector('button[aria-label="Previous"], button[data-testid="previous-button"], .playback-backward-button');
                             if (prevBtn) prevBtn.click();
+                        } else if (action === 'seekTo' && typeof valueMs === 'number') {
+                            var targetSec = Math.max(0, valueMs / 1000);
+                            if (window.MusicKit && typeof window.MusicKit.getInstance === 'function') {
+                                var mk = window.MusicKit.getInstance();
+                                if (mk && typeof mk.seekToTime === 'function') {
+                                    mk.seekToTime(targetSec);
+                                    return;
+                                }
+                            }
+                            var audioEl = document.querySelector('audio');
+                            if (audioEl) {
+                                audioEl.currentTime = targetSec;
+                            }
                         }
                     } catch(e) {
                         console.error('Error dispatching media action:', e);
                     }
+                };
+
+                // Mini-Player Horizontal Swipe Left/Right Gestures with Native Android Haptic Feedback
+                var touchStartX = 0;
+                var touchStartY = 0;
+                document.addEventListener('touchstart', function(e) {
+                    if (!e.touches || e.touches.length === 0) return;
+                    var target = e.target;
+                    var inMiniPlayer = target && target.closest && target.closest(
+                        '.web-chrome-playback-controls, [data-testid="web-chrome-playback-controls"], .mini-player, .chrome-player'
+                    );
+                    if (inMiniPlayer) {
+                        touchStartX = e.touches[0].clientX;
+                        touchStartY = e.touches[0].clientY;
+                    } else {
+                        touchStartX = 0;
+                        touchStartY = 0;
+                    }
+                }, { passive: true });
+
+                document.addEventListener('touchend', function(e) {
+                    if (!touchStartX || !e.changedTouches || e.changedTouches.length === 0) return;
+                    var dx = e.changedTouches[0].clientX - touchStartX;
+                    var dy = e.changedTouches[0].clientY - touchStartY;
+                    touchStartX = 0;
+                    touchStartY = 0;
+                    if (Math.abs(dx) > 64 && Math.abs(dy) < 42) {
+                        if (window.AndroidBridge && typeof window.AndroidBridge.triggerHapticFeedback === 'function') {
+                            window.AndroidBridge.triggerHapticFeedback();
+                        }
+                        if (dx < 0) {
+                            window.dispatchMediaAction('next');
+                        } else {
+                            window.dispatchMediaAction('previous');
+                        }
+                    }
+                }, { passive: true });
+
+                const getPlaybackTiming = function() {
+                    var posMs = 0;
+                    var durMs = 0;
+                    try {
+                        var audioEl = document.querySelector('audio');
+                        if (audioEl) {
+                            posMs = Math.round((audioEl.currentTime || 0) * 1000);
+                            durMs = Math.round((audioEl.duration || 0) * 1000);
+                        }
+                    } catch (_) {}
+                    return { posMs: isFinite(posMs) ? posMs : 0, durMs: isFinite(durMs) ? durMs : 0 };
                 };
 
                 const notifyStateChange = function(playing) {
@@ -1186,12 +1345,16 @@ class MainActivity : AppCompatActivity() {
                         title = navigator.mediaSession.metadata.title || title;
                         artist = navigator.mediaSession.metadata.artist || artist;
                         if (navigator.mediaSession.metadata.artwork && navigator.mediaSession.metadata.artwork.length > 0) {
-                            artwork = navigator.mediaSession.metadata.artwork[0].src || "";
+                            artwork = navigator.mediaSession.metadata.artwork[navigator.mediaSession.metadata.artwork.length - 1].src || "";
                         }
                     }
 
+                    const timing = getPlaybackTiming();
                     if (window.AndroidBridge) {
                         window.AndroidBridge.onPlaybackStateChanged(playing, title, artist, artwork);
+                        if (typeof window.AndroidBridge.onPlaybackProgressUpdated === 'function') {
+                            window.AndroidBridge.onPlaybackProgressUpdated(playing, title, artist, artwork, timing.posMs, timing.durMs);
+                        }
                     }
                 };
 
@@ -1214,7 +1377,10 @@ class MainActivity : AppCompatActivity() {
                             const isPlaying = navigator.mediaSession.playbackState === 'playing';
                             const title = meta.title || '';
                             const artist = meta.artist || '';
-                            const art = (meta.artwork && meta.artwork.length > 0) ? meta.artwork[0].src : '';
+                            const art = (meta.artwork && meta.artwork.length > 0)
+                                ? meta.artwork[meta.artwork.length - 1].src
+                                : '';
+                            const timing = getPlaybackTiming();
                             const signature = title + '|' + artist + '|' + art + '|' + isPlaying;
                             if (signature !== lastMetaSignature) {
                                 lastMetaSignature = signature;
@@ -1222,7 +1388,22 @@ class MainActivity : AppCompatActivity() {
                                     window.AndroidBridge.onMetadataUpdated(title, artist, art, isPlaying);
                                 }
                             }
+                            if (isPlaying && window.AndroidBridge && typeof window.AndroidBridge.onPlaybackProgressUpdated === 'function') {
+                                window.AndroidBridge.onPlaybackProgressUpdated(isPlaying, title, artist, art, timing.posMs, timing.durMs);
+                            }
                         }
+
+                        // Detect Time-Synced Lyrics Panel & keep screen awake while reading lyrics
+                        try {
+                            var lyricsNode = document.querySelector('[data-testid*="lyrics"], .lyrics__container, .web-chrome-lyrics');
+                            var isLyricsOpen = !!(lyricsNode && lyricsNode.offsetParent !== null);
+                            if (isLyricsOpen !== lastLyricsVisible) {
+                                lastLyricsVisible = isLyricsOpen;
+                                if (window.AndroidBridge && typeof window.AndroidBridge.onLyricsVisibilityChanged === 'function') {
+                                    window.AndroidBridge.onLyricsVisibilityChanged(isLyricsOpen);
+                                }
+                            }
+                        } catch (_) {}
                     }, 2000);
                 }
             })();
@@ -1236,6 +1417,163 @@ class MainActivity : AppCompatActivity() {
             try {
                 webView.evaluateJavascript(code, null)
             } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * Interactive Native 5-Band EQ Sound Profile Switcher.
+     * Applies one of the 5 studio curves (apple_studio, bass_boost, vocal_clarity, late_night, flat_bypass)
+     * directly to Session 0 DynamicsProcessing without interrupting playback.
+     */
+    fun applySoundProfilePreset(profileId: String) {
+        currentSoundProfile = profileId
+        sharedPreferences.edit().putString(KEY_SOUND_PROFILE, profileId).apply()
+        appleSignatureAudioEngine?.applySoundProfile(profileId)
+    }
+
+    /**
+     * Custom 5-Band Equalizer & Preamp Gain adjustment on Session 0 DynamicsProcessing.
+     */
+    fun setCustomEqBands(bandGainsDb: FloatArray, preampDb: Float = 0.0f) {
+        appleSignatureAudioEngine?.setCustom5BandEq(bandGainsDb, preampDb)
+    }
+
+    /**
+     * Updates the Web Audio / MusicKit crossfade duration (0s-12s) and persists it.
+     */
+    fun setCrossfadeDuration(seconds: Int) {
+        val clamped = seconds.coerceIn(0, 12)
+        crossfadeSeconds = clamped
+        sharedPreferences.edit().putInt(KEY_CROSSFADE_SECONDS, clamped).apply()
+        executeJavaScript("window.__musicBetaCrossfadeSeconds = $clamped;")
+    }
+
+    /**
+     * Toggles Automatic Cellular Data Saver (64kbps HE-AAC on Cellular, 256kbps AAC on Wi-Fi).
+     */
+    fun setCellularDataSaverEnabled(enabled: Boolean) {
+        isCellularDataSaverEnabled = enabled
+        sharedPreferences.edit().putBoolean(KEY_CELLULAR_DATA_SAVER, enabled).apply()
+        evaluateAndApplyNetworkBitrate()
+    }
+
+    private fun registerAdaptiveNetworkBitrateCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            connectivityManager = cm
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                    super.onCapabilitiesChanged(network, networkCapabilities)
+                    evaluateAndApplyNetworkBitrate(networkCapabilities)
+                }
+            }
+            networkBitrateCallback = callback
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                cm.registerDefaultNetworkCallback(callback)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Adaptive network bitrate callback registration guarded", t)
+        }
+    }
+
+    private fun evaluateAndApplyNetworkBitrate(caps: NetworkCapabilities? = null) {
+        try {
+            val cm = connectivityManager ?: (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+            val capabilities = caps ?: cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            val isCellular = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true &&
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == false
+            val targetKbps = if (isCellular && isCellularDataSaverEnabled) 64 else 256
+            executeJavaScript("if (window.__setMusicKitAdaptiveBitrate) window.__setMusicKitAdaptiveBitrate($targetKbps);")
+        } catch (_: Throwable) {}
+    }
+
+    /**
+     * Smart Sleep Timer with 10-Second Gentle Volume Fade-Out.
+     * Counts down from durationMinutes and smoothly attenuates playback volume over the final 10 seconds
+     * before pausing playback and restoring full volume for the next session.
+     */
+    fun startSleepTimer(durationMinutes: Int) {
+        cancelSleepTimer()
+        if (durationMinutes <= 0) return
+
+        sleepTimerRemainingSeconds = durationMinutes * 60
+        val runnable = object : Runnable {
+            override fun run() {
+                if (sleepTimerRemainingSeconds <= 0) {
+                    executeJavaScript("if (window.__applySleepTimerFade) window.__applySleepTimerFade(1.0); dispatchMediaAction('pause');")
+                    sleepTimerRunnable = null
+                    return
+                }
+                if (sleepTimerRemainingSeconds <= 10) {
+                    val fadeMultiplier = sleepTimerRemainingSeconds.toFloat() / 10.0f
+                    executeJavaScript("if (window.__applySleepTimerFade) window.__applySleepTimerFade($fadeMultiplier);")
+                }
+                sleepTimerRemainingSeconds--
+                sleepTimerHandler.postDelayed(this, 1_000L)
+            }
+        }
+        sleepTimerRunnable = runnable
+        sleepTimerHandler.post(runnable)
+    }
+
+    fun cancelSleepTimer() {
+        sleepTimerRunnable?.let { sleepTimerHandler.removeCallbacks(it) }
+        sleepTimerRunnable = null
+        sleepTimerRemainingSeconds = 0
+        executeJavaScript("if (window.__applySleepTimerFade) window.__applySleepTimerFade(1.0);")
+    }
+
+    /**
+     * Scrubs the active Apple Music track to positionMs from the Android Lock-Screen / Notification Seekbar.
+     */
+    fun seekToPositionMs(positionMs: Long) {
+        executeJavaScript("if (window.dispatchMediaAction) window.dispatchMediaAction('seekTo', $positionMs);")
+    }
+
+    /**
+     * Queries the active hardware output sink (USB-C DAC Bit-Perfect, Bluetooth A2DP, Wired Headset, or Speaker).
+     */
+    fun getActiveAudioOutputStatus(): String {
+        return appleSignatureAudioEngine?.getActiveAudioOutputSinkLabel() ?: "Speaker • Session 0 DSP"
+    }
+
+    /**
+     * Universal Song Link Resolver for Deep Links & Android Share Sheet (Intent.ACTION_SEND).
+     */
+    private fun resolveIncomingOrSharedUrl(incomingIntent: Intent?): String {
+        if (incomingIntent == null) return APPLE_MUSIC_BETA_URL
+        val rawCandidate = when (incomingIntent.action) {
+            Intent.ACTION_SEND -> incomingIntent.getStringExtra(Intent.EXTRA_TEXT)
+            else -> incomingIntent.dataString
+        } ?: return APPLE_MUSIC_BETA_URL
+
+        val urlMatch = Regex("https?://(beta\\.|www\\.)?music\\.apple\\.com[^\\s\"]*", RegexOption.IGNORE_CASE)
+            .find(rawCandidate)?.value
+
+        if (!urlMatch.isNullOrBlank()) {
+            return urlMatch.replace(
+                Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
+                APPLE_MUSIC_BETA_URL
+            )
+        }
+        return APPLE_MUSIC_BETA_URL
+    }
+
+    /**
+     * Launches Android's native Share Sheet with a clean universal Apple Music link.
+     */
+    fun shareCurrentTrack(title: String, artist: String, rawUrl: String?) {
+        try {
+            val cleanUrl = (rawUrl ?: webView.url ?: APPLE_MUSIC_BETA_URL)
+                .replace("https://beta.music.apple.com", "https://music.apple.com")
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, "$title — $artist")
+                putExtra(Intent.EXTRA_TEXT, "Listen to $title by $artist on Apple Music: $cleanUrl")
+            }
+            startActivity(Intent.createChooser(shareIntent, "Share Song"))
+        } catch (t: Throwable) {
+            Log.w(TAG, "Error launching native share sheet", t)
         }
     }
 
@@ -1300,20 +1638,70 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        @JavascriptInterface
+        fun onPlaybackProgressUpdated(
+            isPlaying: Boolean,
+            title: String,
+            artist: String,
+            artworkUrl: String,
+            positionMs: Long,
+            durationMs: Long
+        ) {
+            runOnUiThread {
+                if (isPlaying || this@MainActivity.isPlayingAudio) {
+                    val serviceIntent = Intent(this@MainActivity, MediaPlaybackService::class.java).apply {
+                        action = MediaPlaybackService.ACTION_UPDATE_METADATA
+                        putExtra(MediaPlaybackService.EXTRA_TITLE, title)
+                        putExtra(MediaPlaybackService.EXTRA_ARTIST, artist)
+                        putExtra(MediaPlaybackService.EXTRA_ARTWORK_URL, artworkUrl)
+                        putExtra(MediaPlaybackService.EXTRA_POSITION_MS, positionMs)
+                        putExtra(MediaPlaybackService.EXTRA_DURATION_MS, durationMs)
+                    }
+                    ContextCompat.startForegroundService(this@MainActivity, serviceIntent)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun triggerHapticFeedback() {
+            runOnUiThread {
+                try {
+                    window.decorView.performHapticFeedback(
+                        HapticFeedbackConstants.CONFIRM,
+                        HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING
+                    )
+                } catch (_: Throwable) {}
+            }
+        }
+
+        @JavascriptInterface
+        fun onLyricsVisibilityChanged(isVisible: Boolean) {
+            runOnUiThread {
+                try {
+                    if (isVisible) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
+
+        @JavascriptInterface
+        fun shareTrack(title: String, artist: String, url: String) {
+            runOnUiThread {
+                shareCurrentTrack(title, artist, url)
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        val incomingUrl = intent.dataString
-        if (!incomingUrl.isNullOrBlank() && incomingUrl.contains("music.apple.com", ignoreCase = true)) {
-            val targetUrl = incomingUrl.replace(
-                Regex("^https?://(www\\.)?music\\.apple\\.com", RegexOption.IGNORE_CASE),
-                APPLE_MUSIC_BETA_URL
-            )
-            if (targetUrl != webView.url) {
-                webView.loadUrl(targetUrl)
-            }
+        val targetUrl = resolveIncomingOrSharedUrl(intent)
+        if (targetUrl != APPLE_MUSIC_BETA_URL && targetUrl != webView.url) {
+            webView.loadUrl(targetUrl)
         }
     }
 
@@ -1352,6 +1740,13 @@ class MainActivity : AppCompatActivity() {
             unregisterReceiver(mediaCommandReceiver)
         } catch (_: Throwable) {}
 
+        try {
+            networkBitrateCallback?.let { cb ->
+                connectivityManager?.unregisterNetworkCallback(cb)
+            }
+        } catch (_: Throwable) {}
+        networkBitrateCallback = null
+
         // Detach Singleton WebView from Activity container and rebind MutableContextWrapper to applicationContext
         // so the WebView survives UI recompositions/recreations without leaking the Activity or throwing IllegalStateException
         try {
@@ -1365,6 +1760,7 @@ class MainActivity : AppCompatActivity() {
 
         // Only release global audio DSP if the user is truly finishing the app (not recomposing or rotating)
         if (isFinishing && !isChangingConfigurations && !isPlayingAudio) {
+            cancelSleepTimer()
             try {
                 singletonAudioEngine?.release()
                 singletonAudioEngine = null
@@ -1428,6 +1824,8 @@ class MainActivity : AppCompatActivity() {
  * System #3 & #4: AppleSignatureAudioEngine
  * - Native Android DynamicsProcessing Mastering Engine (API 28+) attached to global audio session 0
  *   so hardware-decoded Widevine DRM WebView streams receive full 5-band Pre-EQ/Post-EQ and Anti-Clip Limiter.
+ * - Supports interactive 5-Band EQ Sound Profile Presets (Apple Studio, Bass Boost, Vocal Clarity, Late Night, Flat Bypass)
+ *   and custom user EQ bands + Preamp Gain.
  * - Android 14+ (API 34+) Bit-Perfect USB DAC / Headset Bypass via AudioManager.registerAudioDeviceCallback
  *   and AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT (44.1kHz PCM Float).
  * - Guarded with isAudioEngineInitialized and full try/catch (Throwable) blocks to prevent duplicate initialization or crashes.
@@ -1439,6 +1837,7 @@ class AppleSignatureAudioEngine(context: Context) {
         private const val GLOBAL_AUDIO_SESSION_ID = 0
         private const val CHANNEL_COUNT = 2
         private const val EQ_BAND_COUNT = 5
+        private val BAND_CUTOFFS_HZ = floatArrayOf(80.0f, 250.0f, 1000.0f, 3500.0f, 20000.0f)
     }
 
     private val appContext: Context = context.applicationContext
@@ -1540,6 +1939,77 @@ class AppleSignatureAudioEngine(context: Context) {
         } catch (t: Throwable) {
             Log.w(TAG, "DynamicsProcessing Session 0 unavailable on this OEM build: ${t.message}")
         }
+    }
+
+    /**
+     * Dynamically applies a named 5-Band Sound Profile Preset to the active Session 0 DynamicsProcessing instance.
+     */
+    fun applySoundProfile(profileId: String) {
+        when (profileId) {
+            MainActivity.PROFILE_BASS_BOOST ->
+                setCustom5BandEq(floatArrayOf(4.5f, 1.0f, 0.0f, 0.8f, 1.8f), preampDb = -1.0f)
+            MainActivity.PROFILE_VOCAL_CLARITY ->
+                setCustom5BandEq(floatArrayOf(0.5f, -1.2f, 1.2f, 2.6f, 2.0f), preampDb = 0.0f)
+            MainActivity.PROFILE_LATE_NIGHT ->
+                setCustom5BandEq(floatArrayOf(3.2f, 0.0f, 0.5f, 1.8f, 3.0f), preampDb = 1.5f)
+            MainActivity.PROFILE_FLAT_BYPASS ->
+                setCustom5BandEq(floatArrayOf(0.0f, 0.0f, 0.0f, 0.0f, 0.0f), preampDb = 0.0f)
+            else ->
+                setCustom5BandEq(floatArrayOf(2.0f, -0.5f, 0.0f, 1.0f, 2.2f), preampDb = 0.0f)
+        }
+    }
+
+    /**
+     * Applies custom 5-band gains ([80Hz, 250Hz, 1kHz, 3.5kHz, 12kHz+]) and Preamp postGain to Session 0.
+     */
+    fun setCustom5BandEq(gainsDb: FloatArray, preampDb: Float = 0.0f) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+        val dp = dynamicsProcessing ?: return
+        if (gainsDb.size < EQ_BAND_COUNT) return
+
+        try {
+            for (i in 0 until EQ_BAND_COUNT) {
+                val cutoff = BAND_CUTOFFS_HZ[i]
+                val preGain = if (i <= 1) gainsDb[i] else 0.0f
+                val postGain = if (i >= 2) gainsDb[i] else 0.0f
+                dp.setPreEqBandAllChannelsTo(i, DynamicsProcessing.EqBand(true, cutoff, preGain))
+                dp.setPostEqBandAllChannelsTo(i, DynamicsProcessing.EqBand(true, cutoff, postGain))
+            }
+            val limiter = DynamicsProcessing.Limiter(
+                true,
+                true,
+                0,
+                2.0f,
+                60.0f,
+                4.0f,
+                -1.0f,
+                preampDb.coerceIn(-6.0f, 6.0f)
+            )
+            dp.setLimiterAllChannelsTo(limiter)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Error updating custom 5-band EQ on Session 0: ${t.message}")
+        }
+    }
+
+    /**
+     * Returns a human-readable HUD string describing the currently active audio output sink.
+     */
+    fun getActiveAudioOutputSinkLabel(): String {
+        try {
+            val devices = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: emptyArray()
+            for (d in devices) {
+                if (isUsbAudioSink(d)) {
+                    return "USB-C DAC (${d.productName}) • Bit-Perfect 44.1kHz Float"
+                }
+                if (d.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || d.type == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    return "Bluetooth (${d.productName}) • 256kbps AAC + Session 0 DSP"
+                }
+                if (d.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES || d.type == AudioDeviceInfo.TYPE_WIRED_HEADSET) {
+                    return "Wired Headphones • 32-Bit Float + Session 0 DSP"
+                }
+            }
+        } catch (_: Throwable) {}
+        return "Speaker • Apple Signature Session 0 DSP"
     }
 
     /**
