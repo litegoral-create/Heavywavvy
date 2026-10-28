@@ -173,6 +173,10 @@ test('generateGpuPerformanceCss and generateSpaBackNavigationScript protect navi
   assert.ok(lightCss.includes('background-color: #ffffff !important'));
   assert.ok(lightCss.includes('z-index: 9999 !important'));
   assert.ok(lightCss.includes('touch-action: pan-y !important'));
+  assert.ok(lightCss.includes('overflow-y: visible !important'));
+  assert.ok(lightCss.includes('.dt-footer'));
+  assert.ok(lightCss.includes('touch-action: pan-x pan-y !important'));
+  assert.ok(!lightCss.includes('html, body, main, .scrollable-page'));
   assert.ok(!lightCss.includes('contain-intrinsic-size: 1px 240px'));
 
   const darkCss = generateGpuPerformanceCss(true);
